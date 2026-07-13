@@ -27,6 +27,8 @@ COMMON_FLAGS=(
   -Wl,-undefined,dynamic_lookup
   -framework
   Cocoa
+  -weak_framework
+  UniformTypeIdentifiers
 )
 
 TMP_ARM="$BUILD_DIR/LUTLayerManager_arm64.ofx"

@@ -6,6 +6,7 @@
 #ifdef __APPLE__
 #import <Cocoa/Cocoa.h>
 #import <dispatch/dispatch.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #endif
 
 #include <algorithm>
@@ -26,7 +27,7 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 0;
+constexpr unsigned int kVersionMinor = 1;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
@@ -320,9 +321,11 @@ std::string chooseCubeFile(const std::string &startPath) {
       [panel setPrompt:@"选择"];
 
       if (@available(macOS 11.0, *)) {
-        panel.allowedContentTypes = @[];
+        UTType *cubeType = [UTType typeWithFilenameExtension:@"cube"];
+        if (cubeType) {
+          panel.allowedContentTypes = @[cubeType];
+        }
       }
-      [panel setAllowedFileTypes:@[@"cube", @"CUBE"]];
 
       std::string directory = fileExists(initial) ? dirnameOf(initial) : initial;
       if (directoryExists(directory)) {
@@ -354,14 +357,28 @@ std::string chooseCubeFile(const std::string &startPath) {
 std::string chooseCubeFile(const std::string &) { return {}; }
 #endif
 
+size_t cubeSampleCount(int size) {
+  if (size <= 1) {
+    return 0;
+  }
+  const size_t dimension = static_cast<size_t>(size);
+  if (dimension > std::numeric_limits<size_t>::max() / dimension ||
+      dimension * dimension > std::numeric_limits<size_t>::max() / dimension) {
+    return 0;
+  }
+  return dimension * dimension * dimension;
+}
+
 struct LutData {
-  enum class Type { Invalid, Lut1D, Lut3D };
+  enum class Type { Invalid, Lut1D, Lut3D, Lut1DThen3D };
 
   Type type = Type::Invalid;
   int size = 0;
+  int shaperSize = 0;
   Vec3 domainMin{0.0, 0.0, 0.0};
   Vec3 domainMax{1.0, 1.0, 1.0};
   std::vector<Vec3> values;
+  std::vector<Vec3> shaperValues;
   std::string error;
 
   bool valid() const {
@@ -369,7 +386,12 @@ struct LutData {
       return size > 1 && values.size() >= static_cast<size_t>(size);
     }
     if (type == Type::Lut3D) {
-      return size > 1 && values.size() >= static_cast<size_t>(size * size * size);
+      return size > 1 && values.size() >= cubeSampleCount(size);
+    }
+    if (type == Type::Lut1DThen3D) {
+      return shaperSize > 1 && size > 1 &&
+             shaperValues.size() >= static_cast<size_t>(shaperSize) &&
+             values.size() >= cubeSampleCount(size);
     }
     return false;
   }
@@ -390,14 +412,37 @@ struct LutData {
     const double g = normalize(rgb.g, domainMin.g, domainMax.g);
     const double b = normalize(rgb.b, domainMin.b, domainMax.b);
 
-    if (type == Type::Lut1D) {
-      return {
-        sample1D(r, 0),
-        sample1D(g, 1),
-        sample1D(b, 2),
+    if (type == Type::Lut1D || type == Type::Lut1DThen3D) {
+      const std::vector<Vec3> &shaper = type == Type::Lut1D ? values : shaperValues;
+      const int shaperResolution = type == Type::Lut1D ? size : shaperSize;
+      const Vec3 shaped = {
+        sample1D(shaper, shaperResolution, r, 0),
+        sample1D(shaper, shaperResolution, g, 1),
+        sample1D(shaper, shaperResolution, b, 2),
       };
+      if (type == Type::Lut1D) {
+        return shaped;
+      }
+      return sample3D(shaped.r, shaped.g, shaped.b);
     }
 
+    return sample3D(r, g, b);
+  }
+
+private:
+  double sample1D(const std::vector<Vec3> &samples, int resolution, double v, int component) const {
+    const double x = v * (resolution - 1);
+    const int i0 = static_cast<int>(std::floor(x));
+    const int i1 = std::min(i0 + 1, resolution - 1);
+    const double t = x - i0;
+    const Vec3 a = samples[static_cast<size_t>(i0)];
+    const Vec3 b = samples[static_cast<size_t>(i1)];
+    const double av = component == 0 ? a.r : (component == 1 ? a.g : a.b);
+    const double bv = component == 0 ? b.r : (component == 1 ? b.g : b.b);
+    return lerp(av, bv, t);
+  }
+
+  Vec3 sample3D(double r, double g, double b) const {
     const double x = r * (size - 1);
     const double y = g * (size - 1);
     const double z = b * (size - 1);
@@ -427,19 +472,6 @@ struct LutData {
     const Vec3 c0 = lerp(c00, c10, ty);
     const Vec3 c1 = lerp(c01, c11, ty);
     return lerp(c0, c1, tz);
-  }
-
-private:
-  double sample1D(double v, int component) const {
-    const double x = v * (size - 1);
-    const int i0 = static_cast<int>(std::floor(x));
-    const int i1 = std::min(i0 + 1, size - 1);
-    const double t = x - i0;
-    const Vec3 a = values[static_cast<size_t>(i0)];
-    const Vec3 b = values[static_cast<size_t>(i1)];
-    const double av = component == 0 ? a.r : (component == 1 ? a.g : a.b);
-    const double bv = component == 0 ? b.r : (component == 1 ? b.g : b.b);
-    return lerp(av, bv, t);
   }
 
   Vec3 at3D(int r, int g, int b) const {
@@ -511,16 +543,37 @@ LutData parseCubeFile(const std::string &path) {
     }
   }
 
+  const size_t required3D = cubeSampleCount(declared3D);
+  if (declared3D > 1 && required3D == 0) {
+    lut.error = "3D LUT size is too large";
+    return lut;
+  }
+
+  if (declared1D > 1 && declared3D > 1) {
+    const size_t required1D = static_cast<size_t>(declared1D);
+    if (required1D > std::numeric_limits<size_t>::max() - required3D ||
+        samples.size() < required1D + required3D) {
+      lut.error = "Combined 1D/3D LUT sample count is smaller than its declared size";
+      return lut;
+    }
+    lut.type = LutData::Type::Lut1DThen3D;
+    lut.shaperSize = declared1D;
+    lut.size = declared3D;
+    lut.shaperValues.assign(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(required1D));
+    lut.values.assign(samples.begin() + static_cast<std::ptrdiff_t>(required1D),
+                      samples.begin() + static_cast<std::ptrdiff_t>(required1D + required3D));
+    return lut;
+  }
+
   if (declared3D > 1) {
     lut.type = LutData::Type::Lut3D;
     lut.size = declared3D;
-    const size_t needed = static_cast<size_t>(declared3D * declared3D * declared3D);
-    if (samples.size() < needed) {
+    if (samples.size() < required3D) {
       lut.error = "3D LUT sample count is smaller than LUT_3D_SIZE";
       lut.type = LutData::Type::Invalid;
       return lut;
     }
-    lut.values.assign(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(needed));
+    lut.values.assign(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(required3D));
     return lut;
   }
 
@@ -687,7 +740,7 @@ Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &pa
     result = result * gain;
   }
 
-  return {clamp01(result.r), clamp01(result.g), clamp01(result.b)};
+  return result;
 }
 
 enum class PixelDepth { Byte, Short, Float, Unsupported };
@@ -806,7 +859,7 @@ uint16_t writeNorm<uint16_t>(double v) {
 
 template <>
 float writeNorm<float>(double v) {
-  return static_cast<float>(clamp01(v));
+  return static_cast<float>(v);
 }
 
 template <typename T>
@@ -877,6 +930,12 @@ void setLabels(OfxPropertySetHandle props, const char *label, const char *shortL
   gProp->propSetString(props, kOfxPropLabel, 0, label);
   gProp->propSetString(props, kOfxPropShortLabel, 0, shortLabel ? shortLabel : label);
   gProp->propSetString(props, kOfxPropLongLabel, 0, longLabel ? longLabel : label);
+}
+
+void setHint(OfxPropertySetHandle props, const char *hint) {
+  if (props && hint) {
+    gProp->propSetString(props, kOfxParamPropHint, 0, hint);
+  }
 }
 
 void setParent(OfxPropertySetHandle props, const char *parent) {
@@ -1016,7 +1075,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
   defineHiddenString(paramSet, kParamCubePath, saved);
   defineChoice(paramSet,
                kParamWorkingSpace,
-               "工作色彩空间",
+               "亮度计算色域",
                "lutFileGroup",
                {"Rec.709",
                 "ARRI LogC3",
@@ -1029,6 +1088,13 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
                 "RED Log3G10",
                 "Canon C-Log2"},
                0);
+  {
+    OfxParamHandle param = nullptr;
+    OfxPropertySetHandle props = nullptr;
+    if (gParam->paramGetHandle(paramSet, kParamWorkingSpace, &param, &props) == kOfxStatOK) {
+      setHint(props, "仅影响亮度分层的计算权重，不进行输入或 LUT 色彩空间转换。");
+    }
+  }
 
   defineGroup(paramSet, "splitStrengthGroup", "分离强度", true);
   defineDouble(paramSet, kParamLumaStrength, "亮度", "splitStrengthGroup", 1.0, 0.0, 2.0, 0.0, 1.5);
@@ -1255,6 +1321,10 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     }
     for (int x = x1; x < x2; ++x) {
       Vec4 src = hasSource ? readPixel(srcInfo, x, y) : Vec4{};
+      if (!lut.valid()) {
+        writePixel(dstInfo, x, y, src);
+        continue;
+      }
       Vec3 layered = applyLayeredLut({src.r, src.g, src.b}, lut, params);
       writePixel(dstInfo, x, y, {layered.r, layered.g, layered.b, src.a});
     }
