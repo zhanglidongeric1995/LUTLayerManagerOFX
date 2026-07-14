@@ -10,7 +10,7 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
 
 最新版安装包：
 
-[下载 LUTLayerManager_1.2.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.2.0.pkg)
+[下载 LUTLayerManager_1.3.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.3.0.pkg)
 
 备用手动安装包（熟悉 OFX 手动安装的用户）：
 
@@ -38,8 +38,9 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
   - `色相偏移`
 - 浮点图像会保留负值和高光余量；未选择 LUT 时，画面保持直通。
 - `.cube 路径` 是一个下拉菜单：第一项是 `选择 .cube 文件...`，后面是历史 LUT。
-- 可分别设置 `节点输入色彩空间` 与 `LUT 色彩空间`。插件会先转换到 LUT 空间，应用 LUT 后再转换回节点空间。
-- 内置 Rec.709 Gamma 2.4、ARRI LogC3/LogC4、Blackmagic Film Gen 5、DaVinci Intermediate、ACEScct、S-Log3、V-Log、Log3G10 和 Canon C-Log2 转换。
+- 可分别设置 `节点输入色彩空间`、`LUT 输入色彩空间` 和 `LUT 输出色彩空间`。
+- `插件输出方式` 可选择返回节点输入空间，或保留技术 LUT 的目标输出空间。
+- 内置 Rec.709 Gamma 2.4、ARRI LogC3/LogC4、Blackmagic Film Gen 5、DaVinci Intermediate、ACEScct、S-Log3、V-Log、Log3G10、Canon C-Log2，以及 DJI D-Log / D-Gamut 转换。
 - 选择过的 LUT 会保存到：
 
 ```text
@@ -88,7 +89,7 @@ rm "$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/OFXPlugi
 输出：
 
 ```text
-outputs/LUTLayerManager_1.2.0.pkg
+outputs/LUTLayerManager_1.3.0.pkg
 ```
 
 ## 对外发布：Developer ID 签名与 Apple 公证
@@ -136,12 +137,24 @@ outputs/LUTLayerManager_版本号.pkg
 2. 拖到节点或素材上。
 3. 在 `LUT 文件` 里点击 `.cube 路径` 下拉菜单。
 4. 选择 `选择 .cube 文件...` 打开文件选择器，或直接选择历史 LUT。
-5. `节点输入色彩空间` 选择进入插件节点时的空间。RCM 项目通常选择时间线色彩空间；普通 YRGB 项目根据插件位于 CST 之前还是之后选择相机空间或 CST 输出空间。
-6. `LUT 色彩空间` 选择 `.cube` 预期的空间。选择 `与节点输入相同（不转换）` 可保持旧版行为。
-7. 用 `亮度` 和 `色彩` 分别控制 LUT 的明暗影响和色彩风格。
-8. 用 `暗部 / 中间调 / 高光` 控制 LUT 在不同亮度区域的强度。
+5. `节点输入色彩空间` 选择实际进入插件节点时的空间。RCM 项目通常选择时间线色彩空间；普通 YRGB 项目根据插件位于 CST 之前还是之后，选择相机空间或 CST 输出空间。
+6. `LUT 输入色彩空间` 选择 `.cube` 在应用之前预期接收的空间。
+7. `LUT 输出色彩空间` 选择 `.cube` 应用之后产生的空间。创意 LUT 通常选择 `与 LUT 输入相同`；相机 Log 转 Rec.709 的技术 LUT 选择 `Rec.709 Gamma 2.4`。
+8. `插件输出方式`：创意 LUT 及 RCM 流程选择 `返回节点输入空间`；在普通 YRGB 流程中需要技术 LUT 直接完成 Log 到 Rec.709 转换时，选择 `保留 LUT 输出空间`。
+9. 用 `亮度` 和 `色彩` 分别控制 LUT 的明暗影响和色彩风格。
+10. 用 `暗部 / 中间调 / 高光` 控制 LUT 在不同亮度区域的强度。
 
-`LUT 色彩空间` 适用于输入和输出处于同一空间的创意/风格 LUT。若 `.cube` 本身是从相机 Log 转换到 Rec.709 的技术 LUT，应在 Resolve 节点流程中明确处理其输出空间，避免重复转换。
+### 色彩空间怎么选
+
+插件无法可靠地从 OpenFX 接口读取 Resolve 为素材设置的相机输入色彩空间，因此不会根据文件名或素材元数据自动猜测。`节点输入色彩空间` 描述的是到达当前节点的像素，不一定是相机拍摄时的原始空间。
+
+| 使用场景 | 节点输入 | LUT 输入 | LUT 输出 | 插件输出方式 |
+| --- | --- | --- | --- | --- |
+| RCM / DWG 时间线中的 Rec.709 创意 LUT | DaVinci Wide Gamut / Intermediate | Rec.709 Gamma 2.4 | 与 LUT 输入相同 | 返回节点输入空间 |
+| 普通 YRGB 中的 DJI D-Log 转 Rec.709 技术 LUT | DJI D-Log / D-Gamut | DJI D-Log / D-Gamut | Rec.709 Gamma 2.4 | 保留 LUT 输出空间 |
+| 普通 YRGB 中，插件位于 CST 之后 | CST 的输出空间 | LUT 实际要求的输入 | LUT 实际产生的输出 | 按后续节点要求选择 |
+
+如果上游 CST 或 Resolve 色彩管理已经把 DJI D-Log 转成了 DWG/Intermediate，当前节点输入就应选择 DWG/Intermediate，而不是因为素材由 DJI 拍摄就继续选择 D-Log。技术型 D-Log 转 Rec.709 LUT 最适合放在尚未执行同类输入转换的节点位置，避免重复转换。
 
 ## 验证
 
@@ -149,12 +162,12 @@ outputs/LUTLayerManager_版本号.pkg
 ./scripts/test_macos.sh
 ```
 
-测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、10 种传递曲线的往返转换，以及与 OpenColorIO ACES Studio 参考结果的一致性。
+测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、11 种传递曲线的往返转换、技术 LUT 的独立输入/输出空间、DJI 官方 D-Log / D-Gamut 参考值，以及与 OpenColorIO ACES Studio 参考结果的一致性。
 
 ## 说明
 
 这个版本是纯 CPU OFX 插件。macOS 上通过原生文件选择器选取 `.cube`，并将实际路径保存在 OFX 参数中；重复使用时可从 LUT 历史菜单直接切换。
 
-色彩转换常数与曲线参考 OpenColorIO 2.3.2 / ACES Studio Config 2.1.0，相关 BSD 许可随插件 bundle 一并提供。
+常规色彩转换常数与曲线参考 OpenColorIO 2.3.2 / ACES Studio Config 2.1.0，相关 BSD 许可随插件 bundle 一并提供。DJI D-Log 曲线与 D-Gamut 色域参考 [DJI X9 D-Log D-Gamut Whitepaper](https://dl.djicdn.com/downloads/DJI_Ronin_4D/X9_D_Log_D_Gamut_Whitepaper_I.pdf)。
 
 本地 `build_macos.sh` 和 `package_macos_pkg.sh` 默认仍使用临时签名，便于开发与测试；对外发布请使用 `release_macos.sh` 生成经过 Developer ID 签名和 Apple 公证的安装包。

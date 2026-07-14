@@ -28,7 +28,7 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 2;
+constexpr unsigned int kVersionMinor = 3;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
@@ -36,6 +36,8 @@ constexpr const char *kParamCubePath = "cubePath";
 // was renamed from "working color space" to "node input color space".
 constexpr const char *kParamWorkingSpace = "workingSpace";
 constexpr const char *kParamLutWorkingSpace = "lutWorkingSpace";
+constexpr const char *kParamLutOutputSpace = "lutOutputSpace";
+constexpr const char *kParamOutputMode = "outputMode";
 constexpr const char *kParamLumaStrength = "lumaStrength";
 constexpr const char *kParamColorStrength = "colorStrength";
 constexpr const char *kParamShadowStrength = "shadowStrength";
@@ -82,9 +84,10 @@ enum class ColorSpaceId : int {
   PanasonicVLog = 7,
   RedLog3G10 = 8,
   CanonLog2 = 9,
+  DjiDLog = 10,
 };
 
-constexpr int kColorSpaceCount = 10;
+constexpr int kColorSpaceCount = 11;
 
 const std::vector<std::string> &colorSpaceLabels() {
   static const std::vector<std::string> labels = {
@@ -98,6 +101,7 @@ const std::vector<std::string> &colorSpaceLabels() {
     "Panasonic V-Log / V-Gamut",
     "RED Log3G10 / REDWideGamutRGB",
     "Canon C-Log2 / Cinema Gamut",
+    "DJI D-Log / D-Gamut",
   };
   return labels;
 }
@@ -149,7 +153,7 @@ Mat3 inverse(const Mat3 &m) {
   }}};
 }
 
-enum class TransferKind { Gamma24, CameraLog, CanonLog2 };
+enum class TransferKind { Gamma24, CameraLog, CanonLog2, DjiDLog };
 
 struct CameraLogCurve {
   double base = 2.0;
@@ -268,6 +272,11 @@ const std::array<ColorSpaceSpec, kColorSpaceCount> &colorSpaceSpecs() {
                          {{{0.763064454775734, 0.14902116113706, 0.0879143840872055,
                             0.00365745670512393, 1.10696038037622, -0.110617837081339,
                             -0.0094077940457189, -0.218383304989987, 1.22779109903571}}}),
+      // DJI D-Log and D-Gamut follow the official X9 color-science whitepaper.
+      makeColorSpaceSpec(TransferKind::DjiDLog, {},
+                         {{{0.691430323905921, 0.212906283248268, 0.0956633928458124,
+                            0.0665972813314137, 1.00954658165132, -0.0761438629827340,
+                            -0.0172435345385446, -0.0729864327663068, 1.09022996730485}}}),
     }};
   }();
   return specs;
@@ -313,6 +322,21 @@ double linearToCanonLog2(double value) {
   return normalized < 0.0 ? pivot - encodedMagnitude : pivot + encodedMagnitude;
 }
 
+double djiDLogToLinear(double value) {
+  if (value <= 0.14) {
+    return (value - 0.0929) / 6.025;
+  }
+  return (std::pow(10.0, 3.89616 * value - 2.27752) - 0.0108) / 0.9892;
+}
+
+double linearToDjiDLog(double value) {
+  if (value <= 0.0078) {
+    return 6.025 * value + 0.0929;
+  }
+  const double argument = std::max(value * 0.9892 + 0.0108, std::numeric_limits<double>::min());
+  return std::log10(argument) * 0.256663 + 0.584555;
+}
+
 double decodeTransfer(double value, const ColorSpaceSpec &spec) {
   if (!std::isfinite(value)) {
     return 0.0;
@@ -324,6 +348,8 @@ double decodeTransfer(double value, const ColorSpaceSpec &spec) {
       return cameraLogToLinear(value, spec.log);
     case TransferKind::CanonLog2:
       return canonLog2ToLinear(value);
+    case TransferKind::DjiDLog:
+      return djiDLogToLinear(value);
   }
   return value;
 }
@@ -339,6 +365,8 @@ double encodeTransfer(double value, const ColorSpaceSpec &spec) {
       return linearToCameraLog(value, spec.log);
     case TransferKind::CanonLog2:
       return linearToCanonLog2(value);
+    case TransferKind::DjiDLog:
+      return linearToDjiDLog(value);
   }
   return value;
 }
@@ -936,7 +964,9 @@ LutData getLut(const std::string &rawPath) {
 struct RenderParams {
   std::string cubePath;
   int nodeColorSpace = 0;
-  int lutColorSpace = -1;
+  int lutInputColorSpace = -1;
+  int lutOutputColorSpace = -1;
+  bool returnToNodeColorSpace = true;
   double lumaStrength = 1.0;
   double colorStrength = 1.0;
   double shadowStrength = 1.0;
@@ -976,17 +1006,24 @@ Vec3 hueRotate(const Vec3 &c, double degrees) {
   };
 }
 
-Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params, int colorSpace) {
+Vec3 applyLayeredLut(const Vec3 &lutInput,
+                     const LutData &lut,
+                     const RenderParams &params,
+                     int lutInputColorSpace,
+                     int lutOutputColorSpace) {
   if (!lut.valid()) {
-    return src;
+    return lutInput;
   }
 
-  const Vec3 weights = lumaWeights(colorSpace);
-  const Vec3 lutRgb = lut.apply(src);
+  const int inputSpace = sanitizeColorSpace(lutInputColorSpace);
+  const int outputSpace = sanitizeColorSpace(lutOutputColorSpace);
+  const Vec3 reference = convertColorSpace(lutInput, inputSpace, outputSpace);
+  const Vec3 weights = lumaWeights(outputSpace);
+  const Vec3 lutRgb = lut.apply(lutInput);
 
-  const double srcY = dotLuma(src, weights);
+  const double srcY = dotLuma(reference, weights);
   const double lutY = dotLuma(lutRgb, weights);
-  const Vec3 srcChroma = src - Vec3{srcY, srcY, srcY};
+  const Vec3 srcChroma = reference - Vec3{srcY, srcY, srcY};
   const Vec3 lutChroma = lutRgb - Vec3{lutY, lutY, lutY};
 
   const double y = clamp01(srcY);
@@ -1033,10 +1070,17 @@ Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &pa
 
 Vec3 applyColorManagedLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params) {
   const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
-  const int lutSpace = params.lutColorSpace < 0 ? nodeSpace : sanitizeColorSpace(params.lutColorSpace);
-  const Vec3 lutInput = convertColorSpace(src, nodeSpace, lutSpace);
-  const Vec3 lutOutput = applyLayeredLut(lutInput, lut, params, lutSpace);
-  return convertColorSpace(lutOutput, lutSpace, nodeSpace);
+  const int lutInputSpace = params.lutInputColorSpace < 0
+                              ? nodeSpace
+                              : sanitizeColorSpace(params.lutInputColorSpace);
+  const int lutOutputSpace = params.lutOutputColorSpace < 0
+                               ? lutInputSpace
+                               : sanitizeColorSpace(params.lutOutputColorSpace);
+  const Vec3 lutInput = convertColorSpace(src, nodeSpace, lutInputSpace);
+  const Vec3 lutOutput = applyLayeredLut(lutInput, lut, params, lutInputSpace, lutOutputSpace);
+  return params.returnToNodeColorSpace
+           ? convertColorSpace(lutOutput, lutOutputSpace, nodeSpace)
+           : lutOutput;
 }
 
 enum class PixelDepth { Byte, Short, Float, Unsupported };
@@ -1363,18 +1407,38 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
   lutSpaceLabels.insert(lutSpaceLabels.end(), colorSpaceLabels().begin(), colorSpaceLabels().end());
   defineChoiceStrings(paramSet,
                       kParamLutWorkingSpace,
-                      "LUT 色彩空间",
+                      "LUT 输入色彩空间",
                       "colorSpaceGroup",
                       lutSpaceLabels,
+                      0);
+  std::vector<std::string> lutOutputLabels = {"与 LUT 输入相同（创意 / 风格 LUT）"};
+  lutOutputLabels.insert(lutOutputLabels.end(), colorSpaceLabels().begin(), colorSpaceLabels().end());
+  defineChoiceStrings(paramSet,
+                      kParamLutOutputSpace,
+                      "LUT 输出色彩空间",
+                      "colorSpaceGroup",
+                      lutOutputLabels,
+                      0);
+  defineChoiceStrings(paramSet,
+                      kParamOutputMode,
+                      "插件输出方式",
+                      "colorSpaceGroup",
+                      {"返回节点输入空间（创意 LUT / RCM）", "保留 LUT 输出空间（技术 LUT）"},
                       0);
   {
     OfxParamHandle param = nullptr;
     OfxPropertySetHandle props = nullptr;
     if (gParam->paramGetHandle(paramSet, kParamWorkingSpace, &param, &props) == kOfxStatOK) {
-      setHint(props, "选择进入当前 OFX 节点的色彩空间；色彩管理项目通常选择时间线色彩空间。");
+      setHint(props, "选择实际进入当前 OFX 节点的色彩空间；它不一定等于相机素材的原始色彩空间。RCM 项目通常选择时间线色彩空间。");
     }
     if (gParam->paramGetHandle(paramSet, kParamLutWorkingSpace, &param, &props) == kOfxStatOK) {
-      setHint(props, "选择 .cube LUT 预期的输入和输出色彩空间；插件会自动转换并在处理后转回节点空间。");
+      setHint(props, "选择 .cube 在应用之前预期接收的色彩空间；只有与节点实际输入不同时才会先做转换。");
+    }
+    if (gParam->paramGetHandle(paramSet, kParamLutOutputSpace, &param, &props) == kOfxStatOK) {
+      setHint(props, "选择 .cube 应用之后产生的色彩空间。创意 LUT 通常与输入相同；D-Log 转 Rec.709 等技术 LUT 应选择 Rec.709。");
+    }
+    if (gParam->paramGetHandle(paramSet, kParamOutputMode, &param, &props) == kOfxStatOK) {
+      setHint(props, "创意 LUT 或 RCM 流程选择返回节点输入空间；需要让技术 LUT 直接输出 Rec.709 等目标空间时选择保留 LUT 输出空间。");
     }
   }
 
@@ -1516,8 +1580,15 @@ RenderParams readRenderParams(OfxImageEffectHandle effect, OfxTime time) {
     params.cubePath = pathForChoiceIndex(getChoiceParam(paramSet, kParamCubeChoice, time, 0), history);
   }
   params.nodeColorSpace = sanitizeColorSpace(getChoiceParam(paramSet, kParamWorkingSpace, time, 0));
-  const int lutSpaceChoice = getChoiceParam(paramSet, kParamLutWorkingSpace, time, 0);
-  params.lutColorSpace = lutSpaceChoice <= 0 ? params.nodeColorSpace : sanitizeColorSpace(lutSpaceChoice - 1);
+  const int lutInputChoice = getChoiceParam(paramSet, kParamLutWorkingSpace, time, 0);
+  params.lutInputColorSpace = lutInputChoice <= 0
+                                ? params.nodeColorSpace
+                                : sanitizeColorSpace(lutInputChoice - 1);
+  const int lutOutputChoice = getChoiceParam(paramSet, kParamLutOutputSpace, time, 0);
+  params.lutOutputColorSpace = lutOutputChoice <= 0
+                                 ? params.lutInputColorSpace
+                                 : sanitizeColorSpace(lutOutputChoice - 1);
+  params.returnToNodeColorSpace = getChoiceParam(paramSet, kParamOutputMode, time, 0) == 0;
   params.lumaStrength = getDoubleParam(paramSet, kParamLumaStrength, time, 1.0);
   params.colorStrength = getDoubleParam(paramSet, kParamColorStrength, time, 1.0);
   params.shadowStrength = getDoubleParam(paramSet, kParamShadowStrength, time, 1.0);

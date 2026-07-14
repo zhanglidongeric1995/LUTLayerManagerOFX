@@ -112,10 +112,11 @@ void testTransferFunctionRoundTrips() {
   const std::vector<double> linearSamples = {-0.01, 0.0, 0.001, 0.01, 0.18, 1.0, 2.0};
   for (int colorSpace = 0; colorSpace < kColorSpaceCount; ++colorSpace) {
     const ColorSpaceSpec &spec = colorSpaceSpec(colorSpace);
+    const double epsilon = colorSpace == static_cast<int>(ColorSpaceId::DjiDLog) ? 1e-6 : 1e-9;
     for (double sample : linearSamples) {
       const double encoded = encodeTransfer(sample, spec);
       const double decoded = decodeTransfer(encoded, spec);
-      require(nearlyEqual(decoded, sample, 1e-9),
+      require(nearlyEqual(decoded, sample, epsilon),
               "Transfer function should round-trip in color space " + std::to_string(colorSpace));
     }
   }
@@ -133,7 +134,11 @@ void testColorSpaceRoundTrips() {
       for (const Vec3 &sample : samples) {
         const Vec3 converted = convertColorSpace(sample, source, destination);
         const Vec3 restored = convertColorSpace(converted, destination, source);
-        requireColorNear(restored, sample, 2e-8,
+        const double epsilon = source == static_cast<int>(ColorSpaceId::DjiDLog) ||
+                                   destination == static_cast<int>(ColorSpaceId::DjiDLog)
+                                 ? 3e-6
+                                 : 2e-8;
+        requireColorNear(restored, sample, epsilon,
                          "Color-space conversion should round-trip from " + std::to_string(source) +
                            " through " + std::to_string(destination));
       }
@@ -158,13 +163,34 @@ void testOpenColorIOReferenceVectors() {
     {0.439001679420471, -0.249659270048141, 5.47329998016357},
   };
 
-  for (int colorSpace = 0; colorSpace < kColorSpaceCount; ++colorSpace) {
-    const ColorSpaceSpec &spec = colorSpaceSpec(colorSpace);
+  for (size_t colorSpace = 0; colorSpace < expected.size(); ++colorSpace) {
+    const ColorSpaceSpec &spec = colorSpaceSpec(static_cast<int>(colorSpace));
     const Vec3 reference = multiply(spec.toReference, decodeTransfer(sample, spec));
-    requireColorNear(reference, expected[static_cast<size_t>(colorSpace)], 6e-5,
+    requireColorNear(reference, expected[colorSpace], 6e-5,
                      "Color transform should match the OpenColorIO reference for space " +
                        std::to_string(colorSpace));
   }
+}
+
+void testDjiOfficialReferenceValues() {
+  const ColorSpaceSpec &dji = colorSpaceSpec(static_cast<int>(ColorSpaceId::DjiDLog));
+  require(nearlyEqual(encodeTransfer(0.0, dji), 95.0 / 1023.0, 5e-5),
+          "DJI D-Log black should match the official 10-bit reference");
+  require(nearlyEqual(encodeTransfer(0.18, dji), 408.0 / 1023.0, 7e-5),
+          "DJI D-Log 18 percent gray should match the official 10-bit reference");
+  require(nearlyEqual(encodeTransfer(0.9, dji), 586.0 / 1023.0, 2e-4),
+          "DJI D-Log 90 percent white should match the official 10-bit reference");
+
+  const Vec3 linearDji{0.3, 0.4, 0.2};
+  const ColorSpaceSpec &rec709 = colorSpaceSpec(static_cast<int>(ColorSpaceId::Rec709Gamma24));
+  const Vec3 linearRec709 = multiply(rec709.fromReference, multiply(dji.toReference, linearDji));
+  const Vec3 officialRec709 = {
+    1.6747 * linearDji.r - 0.5798 * linearDji.g - 0.0949 * linearDji.b,
+    -0.0981 * linearDji.r + 1.3340 * linearDji.g - 0.2359 * linearDji.b,
+    -0.0410 * linearDji.r - 0.2430 * linearDji.g + 1.2840 * linearDji.b,
+  };
+  requireColorNear(linearRec709, officialRec709, 6e-5,
+                   "DJI D-Gamut should match the official D-Gamut to Rec.709 matrix");
 }
 
 void testIdentityLutPreservesColorAcrossWorkingSpaces() {
@@ -175,7 +201,8 @@ void testIdentityLutPreservesColorAcrossWorkingSpaces() {
 
   RenderParams params;
   params.nodeColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
-  params.lutColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
 
   const Vec3 source{0.336, 0.336, 0.336};
   const Vec3 result = applyColorManagedLayeredLut(source, lut, params);
@@ -199,10 +226,12 @@ void testLutWorkingSpaceChangesNonIdentityResult() {
 
   RenderParams rec709Params;
   rec709Params.nodeColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
-  rec709Params.lutColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  rec709Params.lutInputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  rec709Params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
 
   RenderParams logC3Params = rec709Params;
-  logC3Params.lutColorSpace = static_cast<int>(ColorSpaceId::ArriLogC3);
+  logC3Params.lutInputColorSpace = static_cast<int>(ColorSpaceId::ArriLogC3);
+  logC3Params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::ArriLogC3);
 
   const Vec3 source{0.39, 0.44, 0.51};
   const Vec3 rec709Result = applyColorManagedLayeredLut(source, lut, rec709Params);
@@ -211,6 +240,41 @@ void testLutWorkingSpaceChangesNonIdentityResult() {
                             std::abs(rec709Result.g - logC3Result.g) +
                             std::abs(rec709Result.b - logC3Result.b);
   require(difference > 0.01, "Changing the LUT working space should affect a non-identity LUT result");
+}
+
+void testTechnicalLutInputAndOutputSpaces() {
+  const std::string path = temporaryCubePath("technical_lut");
+  std::string contents = "LUT_3D_SIZE 2\n";
+  for (int b = 0; b < 2; ++b) {
+    for (int g = 0; g < 2; ++g) {
+      for (int r = 0; r < 2; ++r) {
+        contents += std::to_string(1 - r) + " " + std::to_string(1 - g) + " " + std::to_string(1 - b) + "\n";
+      }
+    }
+  }
+  writeTextFile(path, contents);
+  const LutData lut = parseCubeFile(path);
+  std::remove(path.c_str());
+
+  RenderParams params;
+  params.nodeColorSpace = static_cast<int>(ColorSpaceId::DjiDLog);
+  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::DjiDLog);
+  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.returnToNodeColorSpace = false;
+
+  const Vec3 source{0.32, 0.41, 0.56};
+  const Vec3 expectedLutOutput = lut.apply(source);
+  const Vec3 keptOutput = applyColorManagedLayeredLut(source, lut, params);
+  requireColorNear(keptOutput, expectedLutOutput, 1e-9,
+                   "Technical LUT mode should preserve the declared LUT output encoding");
+
+  params.returnToNodeColorSpace = true;
+  const Vec3 returnedOutput = applyColorManagedLayeredLut(source, lut, params);
+  const Vec3 expectedReturned = convertColorSpace(expectedLutOutput,
+                                                  static_cast<int>(ColorSpaceId::Rec709Gamma24),
+                                                  static_cast<int>(ColorSpaceId::DjiDLog));
+  requireColorNear(returnedOutput, expectedReturned, 1e-9,
+                   "Color-managed mode should convert the declared LUT output back to the node space");
 }
 
 }  // namespace
@@ -224,8 +288,10 @@ int main() {
     testTransferFunctionRoundTrips();
     testColorSpaceRoundTrips();
     testOpenColorIOReferenceVectors();
+    testDjiOfficialReferenceValues();
     testIdentityLutPreservesColorAcrossWorkingSpaces();
     testLutWorkingSpaceChangesNonIdentityResult();
+    testTechnicalLutInputAndOutputSpaces();
     std::cout << "LUTLayerManager tests passed\n";
     return 0;
   } catch (const std::exception &error) {
