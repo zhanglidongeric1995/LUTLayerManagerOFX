@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -27,11 +28,14 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 1;
+constexpr unsigned int kVersionMinor = 2;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
+// Keep this ID for compatibility with projects created before the parameter
+// was renamed from "working color space" to "node input color space".
 constexpr const char *kParamWorkingSpace = "workingSpace";
+constexpr const char *kParamLutWorkingSpace = "lutWorkingSpace";
 constexpr const char *kParamLumaStrength = "lumaStrength";
 constexpr const char *kParamColorStrength = "colorStrength";
 constexpr const char *kParamShadowStrength = "shadowStrength";
@@ -66,6 +70,300 @@ struct Vec4 {
 Vec3 operator+(const Vec3 &a, const Vec3 &b) { return {a.r + b.r, a.g + b.g, a.b + b.b}; }
 Vec3 operator-(const Vec3 &a, const Vec3 &b) { return {a.r - b.r, a.g - b.g, a.b - b.b}; }
 Vec3 operator*(const Vec3 &a, double s) { return {a.r * s, a.g * s, a.b * s}; }
+
+enum class ColorSpaceId : int {
+  Rec709Gamma24 = 0,
+  ArriLogC3 = 1,
+  ArriLogC4 = 2,
+  BmdFilmGen5 = 3,
+  DaVinciIntermediate = 4,
+  ACEScct = 5,
+  SonySLog3Cine = 6,
+  PanasonicVLog = 7,
+  RedLog3G10 = 8,
+  CanonLog2 = 9,
+};
+
+constexpr int kColorSpaceCount = 10;
+
+const std::vector<std::string> &colorSpaceLabels() {
+  static const std::vector<std::string> labels = {
+    "Rec.709 Gamma 2.4",
+    "ARRI LogC3 / Wide Gamut 3 (EI800)",
+    "ARRI LogC4 / Wide Gamut 4",
+    "Blackmagic Film Gen 5 / Wide Gamut",
+    "DaVinci Wide Gamut / Intermediate",
+    "ACEScct / AP1",
+    "Sony S-Log3 / S-Gamut3.Cine",
+    "Panasonic V-Log / V-Gamut",
+    "RED Log3G10 / REDWideGamutRGB",
+    "Canon C-Log2 / Cinema Gamut",
+  };
+  return labels;
+}
+
+int sanitizeColorSpace(int value) {
+  return value >= 0 && value < kColorSpaceCount ? value : static_cast<int>(ColorSpaceId::Rec709Gamma24);
+}
+
+struct Mat3 {
+  std::array<double, 9> v{};
+};
+
+Vec3 multiply(const Mat3 &m, const Vec3 &c) {
+  return {
+    m.v[0] * c.r + m.v[1] * c.g + m.v[2] * c.b,
+    m.v[3] * c.r + m.v[4] * c.g + m.v[5] * c.b,
+    m.v[6] * c.r + m.v[7] * c.g + m.v[8] * c.b,
+  };
+}
+
+Mat3 inverse(const Mat3 &m) {
+  const double a = m.v[0];
+  const double b = m.v[1];
+  const double c = m.v[2];
+  const double d = m.v[3];
+  const double e = m.v[4];
+  const double f = m.v[5];
+  const double g = m.v[6];
+  const double h = m.v[7];
+  const double i = m.v[8];
+  const double determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  if (std::abs(determinant) < 1e-15) {
+    return {{{1.0, 0.0, 0.0,
+              0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0}}};
+  }
+
+  const double s = 1.0 / determinant;
+  return {{{
+    (e * i - f * h) * s,
+    (c * h - b * i) * s,
+    (b * f - c * e) * s,
+    (f * g - d * i) * s,
+    (a * i - c * g) * s,
+    (c * d - a * f) * s,
+    (d * h - e * g) * s,
+    (b * g - a * h) * s,
+    (a * e - b * d) * s,
+  }}};
+}
+
+enum class TransferKind { Gamma24, CameraLog, CanonLog2 };
+
+struct CameraLogCurve {
+  double base = 2.0;
+  double linSideSlope = 1.0;
+  double linSideOffset = 0.0;
+  double logSideSlope = 1.0;
+  double logSideOffset = 0.0;
+  double linSideBreak = 0.0;
+  double linearSlope = 0.0;
+  double linearOffset = 0.0;
+  double logSideBreak = 0.0;
+};
+
+CameraLogCurve prepareCameraLogCurve(CameraLogCurve curve) {
+  const double logArgument = curve.linSideSlope * curve.linSideBreak + curve.linSideOffset;
+  curve.logSideBreak = curve.logSideSlope * (std::log(logArgument) / std::log(curve.base)) + curve.logSideOffset;
+  if (curve.linearSlope <= 0.0) {
+    curve.linearSlope = curve.logSideSlope * curve.linSideSlope /
+                        (logArgument * std::log(curve.base));
+  }
+  curve.linearOffset = curve.logSideBreak - curve.linearSlope * curve.linSideBreak;
+  return curve;
+}
+
+struct ColorSpaceSpec {
+  TransferKind transfer = TransferKind::Gamma24;
+  CameraLogCurve log;
+  Mat3 toReference;
+  Mat3 fromReference;
+  Vec3 lumaWeights;
+};
+
+Vec3 deriveLumaWeights(const Mat3 &toReference) {
+  // ACES AP0 RGB to XYZ Y row. Multiplying by the source-to-AP0 matrix
+  // yields weights appropriate to each source gamut.
+  constexpr Vec3 ap0Y{0.343966449765075, 0.728166096613485, -0.0721325463785608};
+  Vec3 weights = {
+    ap0Y.r * toReference.v[0] + ap0Y.g * toReference.v[3] + ap0Y.b * toReference.v[6],
+    ap0Y.r * toReference.v[1] + ap0Y.g * toReference.v[4] + ap0Y.b * toReference.v[7],
+    ap0Y.r * toReference.v[2] + ap0Y.g * toReference.v[5] + ap0Y.b * toReference.v[8],
+  };
+  const double sum = weights.r + weights.g + weights.b;
+  if (std::abs(sum) > 1e-12) {
+    weights = weights * (1.0 / sum);
+  }
+  return weights;
+}
+
+ColorSpaceSpec makeColorSpaceSpec(TransferKind transfer, CameraLogCurve log, const Mat3 &toReference) {
+  ColorSpaceSpec spec;
+  spec.transfer = transfer;
+  spec.log = transfer == TransferKind::CameraLog ? prepareCameraLogCurve(log) : log;
+  spec.toReference = toReference;
+  spec.fromReference = inverse(toReference);
+  spec.lumaWeights = deriveLumaWeights(toReference);
+  return spec;
+}
+
+const std::array<ColorSpaceSpec, kColorSpaceCount> &colorSpaceSpecs() {
+  // Transfer parameters and source-to-ACES2065-1 matrices follow OpenColorIO
+  // 2.3.2 / ACES Studio Config 2.1.0. The BSD license is bundled in Resources.
+  static const std::array<ColorSpaceSpec, kColorSpaceCount> specs = [] {
+    const Mat3 ap0ToRec709{{{
+      2.52168618674388, -1.13413098823972, -0.387555198504164,
+      -0.276479914229922, 1.37271908766826, -0.096239173438334,
+      -0.0153780649660342, -0.152975335867399, 1.16835340083343,
+    }}};
+
+    return std::array<ColorSpaceSpec, kColorSpaceCount>{{
+      makeColorSpaceSpec(TransferKind::Gamma24, {}, inverse(ap0ToRec709)),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {10.0, 5.55555555555556, 0.0522722750251688, 0.247189638318671,
+                          0.385536998692443, 0.0105909904954696},
+                         {{{0.680205505106279, 0.236136601606481, 0.0836578932872398,
+                            0.0854149797421404, 1.01747087860704, -0.102885858349182,
+                            0.00205652166929683, -0.0625625003847921, 1.06050597871549}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {2.0, 2231.82630906769, 64.0, 0.0647954196341293,
+                          -0.295908392682586, -0.0180569961199113},
+                         {{{0.750957362824734, 0.144422786709757, 0.104619850465509,
+                            0.000821837079380207, 1.007397584885, -0.00821942196438358,
+                            -0.000499952143533471, -0.000854177231436971, 1.00135412937497}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {2.71828182845905, 1.0, 0.00549407243225781, 0.0869287606549122,
+                          0.530013339229194, 0.005},
+                         {{{0.647091325580708, 0.242595385134207, 0.110313289285085,
+                            0.0651915997328519, 1.02504756760476, -0.0902391673376125,
+                            -0.0275570729194699, -0.0805887097177784, 1.10814578263725}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {2.0, 1.0, 0.0075, 0.07329248, 0.51304736, 0.00262409, 10.44426855},
+                         {{{0.748270290272981, 0.167694659554328, 0.0840350501726906,
+                            0.0208421234689102, 1.11190474268894, -0.132746866157851,
+                            -0.0915122574225729, -0.127746712807307, 1.21925897022988}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {2.0, 1.0, 0.0, 0.0570776255707763, 0.554794520547945, 0.0078125},
+                         {{{0.695452241357452, 0.140678696470294, 0.163869062172254,
+                            0.0447945633720377, 0.859671118456422, 0.0955343181715404,
+                            -0.00552588255811354, 0.00402521030597866, 1.00150067225213}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {10.0, 5.26315789473684, 0.0526315789473684, 0.255620723362659,
+                          0.410557184750733, 0.01125, 6.62194371177582},
+                         {{{0.638788667185978, 0.272351433711262, 0.0888598991027595,
+                            -0.00391590602528224, 1.0880732308974, -0.0841573248721177,
+                            -0.0299072021239151, -0.0264325799101947, 1.05633978203411}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {10.0, 1.0, 0.00873, 0.241514, 0.598206, 0.01},
+                         {{{0.72461670413153, 0.166915288193706, 0.108468007674764,
+                            0.021390245413146, 0.984908155703054, -0.00629840111620089,
+                            -0.00923556287076561, -0.00105690563900513, 1.01029246850977}}}),
+      makeColorSpaceSpec(TransferKind::CameraLog,
+                         {10.0, 155.975327, 2.55975327, 0.224282, 0.0, -0.01},
+                         {{{0.785058804068092, 0.0838587565440846, 0.131082439387823,
+                            0.0231738348454756, 1.08789754919233, -0.111071384037806,
+                            -0.0737604353682082, -0.314590072290208, 1.38835050765842}}}),
+      makeColorSpaceSpec(TransferKind::CanonLog2, {},
+                         {{{0.763064454775734, 0.14902116113706, 0.0879143840872055,
+                            0.00365745670512393, 1.10696038037622, -0.110617837081339,
+                            -0.0094077940457189, -0.218383304989987, 1.22779109903571}}}),
+    }};
+  }();
+  return specs;
+}
+
+const ColorSpaceSpec &colorSpaceSpec(int colorSpace) {
+  return colorSpaceSpecs()[static_cast<size_t>(sanitizeColorSpace(colorSpace))];
+}
+
+double cameraLogToLinear(double value, const CameraLogCurve &curve) {
+  if (value <= curve.logSideBreak) {
+    return (value - curve.linearOffset) / curve.linearSlope;
+  }
+  return (std::pow(curve.base, (value - curve.logSideOffset) / curve.logSideSlope) - curve.linSideOffset) /
+         curve.linSideSlope;
+}
+
+double linearToCameraLog(double value, const CameraLogCurve &curve) {
+  if (value <= curve.linSideBreak) {
+    return curve.linearSlope * value + curve.linearOffset;
+  }
+  const double argument = std::max(curve.linSideSlope * value + curve.linSideOffset,
+                                   std::numeric_limits<double>::min());
+  return curve.logSideSlope * (std::log(argument) / std::log(curve.base)) + curve.logSideOffset;
+}
+
+double canonLog2ToLinear(double value) {
+  constexpr double pivot = 0.092864125;
+  constexpr double slope = 0.24136077;
+  constexpr double gain = 87.099375;
+  const double magnitude = value < pivot
+                             ? -(std::pow(10.0, (pivot - value) / slope) - 1.0) / gain
+                             : (std::pow(10.0, (value - pivot) / slope) - 1.0) / gain;
+  return magnitude * 0.9;
+}
+
+double linearToCanonLog2(double value) {
+  constexpr double pivot = 0.092864125;
+  constexpr double slope = 0.24136077;
+  constexpr double gain = 87.099375;
+  const double normalized = value / 0.9;
+  const double encodedMagnitude = slope * std::log10(1.0 + std::abs(normalized) * gain);
+  return normalized < 0.0 ? pivot - encodedMagnitude : pivot + encodedMagnitude;
+}
+
+double decodeTransfer(double value, const ColorSpaceSpec &spec) {
+  if (!std::isfinite(value)) {
+    return 0.0;
+  }
+  switch (spec.transfer) {
+    case TransferKind::Gamma24:
+      return value < 0.0 ? value : std::pow(value, 2.4);
+    case TransferKind::CameraLog:
+      return cameraLogToLinear(value, spec.log);
+    case TransferKind::CanonLog2:
+      return canonLog2ToLinear(value);
+  }
+  return value;
+}
+
+double encodeTransfer(double value, const ColorSpaceSpec &spec) {
+  if (!std::isfinite(value)) {
+    return 0.0;
+  }
+  switch (spec.transfer) {
+    case TransferKind::Gamma24:
+      return value < 0.0 ? value : std::pow(value, 1.0 / 2.4);
+    case TransferKind::CameraLog:
+      return linearToCameraLog(value, spec.log);
+    case TransferKind::CanonLog2:
+      return linearToCanonLog2(value);
+  }
+  return value;
+}
+
+Vec3 decodeTransfer(const Vec3 &value, const ColorSpaceSpec &spec) {
+  return {decodeTransfer(value.r, spec), decodeTransfer(value.g, spec), decodeTransfer(value.b, spec)};
+}
+
+Vec3 encodeTransfer(const Vec3 &value, const ColorSpaceSpec &spec) {
+  return {encodeTransfer(value.r, spec), encodeTransfer(value.g, spec), encodeTransfer(value.b, spec)};
+}
+
+Vec3 convertColorSpace(const Vec3 &value, int sourceSpace, int destinationSpace) {
+  const int source = sanitizeColorSpace(sourceSpace);
+  const int destination = sanitizeColorSpace(destinationSpace);
+  if (source == destination) {
+    return value;
+  }
+
+  const ColorSpaceSpec &sourceSpec = colorSpaceSpec(source);
+  const ColorSpaceSpec &destinationSpec = colorSpaceSpec(destination);
+  const Vec3 referenceLinear = multiply(sourceSpec.toReference, decodeTransfer(value, sourceSpec));
+  const Vec3 destinationLinear = multiply(destinationSpec.fromReference, referenceLinear);
+  return encodeTransfer(destinationLinear, destinationSpec);
+}
 
 double clamp01(double v) {
   if (!std::isfinite(v)) {
@@ -637,7 +935,8 @@ LutData getLut(const std::string &rawPath) {
 
 struct RenderParams {
   std::string cubePath;
-  int workingSpace = 0;
+  int nodeColorSpace = 0;
+  int lutColorSpace = -1;
   double lumaStrength = 1.0;
   double colorStrength = 1.0;
   double shadowStrength = 1.0;
@@ -651,18 +950,7 @@ struct RenderParams {
   double hueShift = 0.0;
 };
 
-Vec3 lumaWeights(int workingSpace) {
-  switch (workingSpace) {
-    case 5:  // ACEScct/AP1
-      return {0.2722287168, 0.6740817658, 0.0536895174};
-    case 6:  // S-Gamut3.Cine approximation
-      return {0.2120, 0.7010, 0.0870};
-    case 7:  // V-Gamut approximation
-      return {0.2627, 0.6780, 0.0593};
-    default:
-      return {0.2126, 0.7152, 0.0722};
-  }
-}
+Vec3 lumaWeights(int colorSpace) { return colorSpaceSpec(colorSpace).lumaWeights; }
 
 double dotLuma(const Vec3 &v, const Vec3 &w) { return v.r * w.r + v.g * w.g + v.b * w.b; }
 
@@ -688,13 +976,13 @@ Vec3 hueRotate(const Vec3 &c, double degrees) {
   };
 }
 
-Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params) {
+Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params, int colorSpace) {
   if (!lut.valid()) {
     return src;
   }
 
-  const Vec3 weights = lumaWeights(params.workingSpace);
-  const Vec3 lutRgb = lut.apply({clamp01(src.r), clamp01(src.g), clamp01(src.b)});
+  const Vec3 weights = lumaWeights(colorSpace);
+  const Vec3 lutRgb = lut.apply(src);
 
   const double srcY = dotLuma(src, weights);
   const double lutY = dotLuma(lutRgb, weights);
@@ -741,6 +1029,14 @@ Vec3 applyLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &pa
   }
 
   return result;
+}
+
+Vec3 applyColorManagedLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params) {
+  const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
+  const int lutSpace = params.lutColorSpace < 0 ? nodeSpace : sanitizeColorSpace(params.lutColorSpace);
+  const Vec3 lutInput = convertColorSpace(src, nodeSpace, lutSpace);
+  const Vec3 lutOutput = applyLayeredLut(lutInput, lut, params, lutSpace);
+  return convertColorSpace(lutOutput, lutSpace, nodeSpace);
 }
 
 enum class PixelDepth { Byte, Short, Float, Unsupported };
@@ -975,24 +1271,6 @@ void defineDouble(OfxParamSetHandle paramSet,
   gProp->propSetDouble(props, kOfxParamPropDisplayMax, 0, displayMax);
 }
 
-void defineChoice(OfxParamSetHandle paramSet,
-                  const char *name,
-                  const char *label,
-                  const char *parent,
-                  const std::vector<const char *> &options,
-                  int def) {
-  OfxPropertySetHandle props = nullptr;
-  if (gParam->paramDefine(paramSet, kOfxParamTypeChoice, name, &props) != kOfxStatOK) {
-    return;
-  }
-  setLabels(props, label);
-  setParent(props, parent);
-  for (size_t i = 0; i < options.size(); ++i) {
-    gProp->propSetString(props, kOfxParamPropChoiceOption, static_cast<int>(i), options[i]);
-  }
-  gProp->propSetInt(props, kOfxParamPropDefault, 0, def);
-}
-
 void defineChoiceStrings(OfxParamSetHandle paramSet,
                          const char *name,
                          const char *label,
@@ -1073,26 +1351,30 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
   defineGroup(paramSet, "lutFileGroup", "LUT 文件", true);
   defineChoiceStrings(paramSet, kParamCubeChoice, ".cube 路径", "lutFileGroup", lutOptions, choiceIndexForPath(saved, history));
   defineHiddenString(paramSet, kParamCubePath, saved);
-  defineChoice(paramSet,
-               kParamWorkingSpace,
-               "亮度计算色域",
-               "lutFileGroup",
-               {"Rec.709",
-                "ARRI LogC3",
-                "ARRI LogC4",
-                "Blackmagic Film Gen 5",
-                "DaVinci Wide Gamut",
-                "ACEScct",
-                "S-Log3 / S-Gamut3.Cine",
-                "V-Log / V-Gamut",
-                "RED Log3G10",
-                "Canon C-Log2"},
-               0);
+
+  defineGroup(paramSet, "colorSpaceGroup", "色彩空间转换", true);
+  defineChoiceStrings(paramSet,
+                      kParamWorkingSpace,
+                      "节点输入色彩空间",
+                      "colorSpaceGroup",
+                      colorSpaceLabels(),
+                      0);
+  std::vector<std::string> lutSpaceLabels = {"与节点输入相同（不转换）"};
+  lutSpaceLabels.insert(lutSpaceLabels.end(), colorSpaceLabels().begin(), colorSpaceLabels().end());
+  defineChoiceStrings(paramSet,
+                      kParamLutWorkingSpace,
+                      "LUT 色彩空间",
+                      "colorSpaceGroup",
+                      lutSpaceLabels,
+                      0);
   {
     OfxParamHandle param = nullptr;
     OfxPropertySetHandle props = nullptr;
     if (gParam->paramGetHandle(paramSet, kParamWorkingSpace, &param, &props) == kOfxStatOK) {
-      setHint(props, "仅影响亮度分层的计算权重，不进行输入或 LUT 色彩空间转换。");
+      setHint(props, "选择进入当前 OFX 节点的色彩空间；色彩管理项目通常选择时间线色彩空间。");
+    }
+    if (gParam->paramGetHandle(paramSet, kParamLutWorkingSpace, &param, &props) == kOfxStatOK) {
+      setHint(props, "选择 .cube LUT 预期的输入和输出色彩空间；插件会自动转换并在处理后转回节点空间。");
     }
   }
 
@@ -1233,7 +1515,9 @@ RenderParams readRenderParams(OfxImageEffectHandle effect, OfxTime time) {
     const std::vector<std::string> history = readLutHistory();
     params.cubePath = pathForChoiceIndex(getChoiceParam(paramSet, kParamCubeChoice, time, 0), history);
   }
-  params.workingSpace = getChoiceParam(paramSet, kParamWorkingSpace, time, 0);
+  params.nodeColorSpace = sanitizeColorSpace(getChoiceParam(paramSet, kParamWorkingSpace, time, 0));
+  const int lutSpaceChoice = getChoiceParam(paramSet, kParamLutWorkingSpace, time, 0);
+  params.lutColorSpace = lutSpaceChoice <= 0 ? params.nodeColorSpace : sanitizeColorSpace(lutSpaceChoice - 1);
   params.lumaStrength = getDoubleParam(paramSet, kParamLumaStrength, time, 1.0);
   params.colorStrength = getDoubleParam(paramSet, kParamColorStrength, time, 1.0);
   params.shadowStrength = getDoubleParam(paramSet, kParamShadowStrength, time, 1.0);
@@ -1325,7 +1609,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         writePixel(dstInfo, x, y, src);
         continue;
       }
-      Vec3 layered = applyLayeredLut({src.r, src.g, src.b}, lut, params);
+      Vec3 layered = applyColorManagedLayeredLut({src.r, src.g, src.b}, lut, params);
       writePixel(dstInfo, x, y, {layered.r, layered.g, layered.b, src.a});
     }
   }
