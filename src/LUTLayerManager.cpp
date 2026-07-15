@@ -1,7 +1,11 @@
 #include "ofxCore.h"
+#include "ofxGPURender.h"
 #include "ofxImageEffect.h"
+#include "ofxMultiThread.h"
 #include "ofxParam.h"
 #include "ofxProperty.h"
+
+#include "LUTLayerManagerMetal.h"
 
 #ifdef __APPLE__
 #import <Cocoa/Cocoa.h>
@@ -10,17 +14,21 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +36,7 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 3;
+constexpr unsigned int kVersionMinor = 4;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
@@ -54,6 +62,7 @@ OfxHost *gHost = nullptr;
 OfxPropertySuiteV1 *gProp = nullptr;
 OfxImageEffectSuiteV1 *gEffect = nullptr;
 OfxParameterSuiteV1 *gParam = nullptr;
+OfxMultiThreadSuiteV1 *gThread = nullptr;
 thread_local bool gParamSyncInProgress = false;
 
 struct Vec3 {
@@ -151,6 +160,19 @@ Mat3 inverse(const Mat3 &m) {
     (b * g - a * h) * s,
     (a * e - b * d) * s,
   }}};
+}
+
+Mat3 multiply(const Mat3 &a, const Mat3 &b) {
+  Mat3 result;
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      result.v[static_cast<size_t>(row * 3 + column)] =
+        a.v[static_cast<size_t>(row * 3)] * b.v[static_cast<size_t>(column)] +
+        a.v[static_cast<size_t>(row * 3 + 1)] * b.v[static_cast<size_t>(3 + column)] +
+        a.v[static_cast<size_t>(row * 3 + 2)] * b.v[static_cast<size_t>(6 + column)];
+    }
+  }
+  return result;
 }
 
 enum class TransferKind { Gamma24, CameraLog, CanonLog2, DjiDLog };
@@ -379,7 +401,7 @@ Vec3 encodeTransfer(const Vec3 &value, const ColorSpaceSpec &spec) {
   return {encodeTransfer(value.r, spec), encodeTransfer(value.g, spec), encodeTransfer(value.b, spec)};
 }
 
-Vec3 convertColorSpace(const Vec3 &value, int sourceSpace, int destinationSpace) {
+[[maybe_unused]] Vec3 convertColorSpace(const Vec3 &value, int sourceSpace, int destinationSpace) {
   const int source = sanitizeColorSpace(sourceSpace);
   const int destination = sanitizeColorSpace(destinationSpace);
   if (source == destination) {
@@ -391,6 +413,147 @@ Vec3 convertColorSpace(const Vec3 &value, int sourceSpace, int destinationSpace)
   const Vec3 referenceLinear = multiply(sourceSpec.toReference, decodeTransfer(value, sourceSpec));
   const Vec3 destinationLinear = multiply(destinationSpec.fromReference, referenceLinear);
   return encodeTransfer(destinationLinear, destinationSpec);
+}
+
+struct TransferLookup {
+  std::vector<float> decodedUnit;
+  std::vector<float> encodedRange;
+  double encodeMinimum = 0.0;
+  double encodeMaximum = 0.0;
+};
+
+const std::array<TransferLookup, kColorSpaceCount> &transferLookups() {
+  constexpr int kDecodeEntries = 16385;
+  constexpr int kEncodeEntries = 65537;
+  constexpr double kEncodeMaximum = 64.0;
+  static const std::array<TransferLookup, kColorSpaceCount> lookups = [=] {
+    std::array<TransferLookup, kColorSpaceCount> result;
+    for (int colorSpace = 0; colorSpace < kColorSpaceCount; ++colorSpace) {
+      const ColorSpaceSpec &spec = colorSpaceSpec(colorSpace);
+      TransferLookup &lookup = result[static_cast<size_t>(colorSpace)];
+      lookup.decodedUnit.resize(kDecodeEntries);
+      for (int i = 0; i < kDecodeEntries; ++i) {
+        const double value = static_cast<double>(i) / static_cast<double>(kDecodeEntries - 1);
+        lookup.decodedUnit[static_cast<size_t>(i)] = static_cast<float>(decodeTransfer(value, spec));
+      }
+
+      switch (spec.transfer) {
+        case TransferKind::Gamma24:
+          // Keep the steep near-black portion exact; the rest is smooth enough for interpolation.
+          lookup.encodeMinimum = 0.01;
+          break;
+        case TransferKind::CameraLog:
+          lookup.encodeMinimum = spec.log.linSideBreak;
+          break;
+        case TransferKind::DjiDLog:
+          lookup.encodeMinimum = 0.0078;
+          break;
+        case TransferKind::CanonLog2:
+          // Canon Log 2 is symmetric around zero and remains on the exact path.
+          continue;
+      }
+
+      lookup.encodeMaximum = kEncodeMaximum;
+      lookup.encodedRange.resize(kEncodeEntries);
+      for (int i = 0; i < kEncodeEntries; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(kEncodeEntries - 1);
+        const double value = lookup.encodeMinimum +
+                             (lookup.encodeMaximum - lookup.encodeMinimum) * t;
+        lookup.encodedRange[static_cast<size_t>(i)] = static_cast<float>(encodeTransfer(value, spec));
+      }
+    }
+    return result;
+  }();
+  return lookups;
+}
+
+double sampleLookup(const std::vector<float> &values, double position) {
+  if (values.size() < 2) {
+    return 0.0;
+  }
+  const double maximum = static_cast<double>(values.size() - 1);
+  const double clamped = std::max(0.0, std::min(maximum, position));
+  const size_t lower = std::min(static_cast<size_t>(clamped), values.size() - 2);
+  const double fraction = clamped - static_cast<double>(lower);
+  const double first = static_cast<double>(values[lower]);
+  return first + (static_cast<double>(values[lower + 1]) - first) * fraction;
+}
+
+double decodeTransferFast(double value, const ColorSpaceSpec &spec, const TransferLookup &lookup) {
+  if (value < 0.0 || value > 1.0 || !std::isfinite(value) || lookup.decodedUnit.empty()) {
+    return decodeTransfer(value, spec);
+  }
+  return sampleLookup(lookup.decodedUnit,
+                      value * static_cast<double>(lookup.decodedUnit.size() - 1));
+}
+
+double encodeTransferFast(double value, const ColorSpaceSpec &spec, const TransferLookup &lookup) {
+  if (!lookup.encodedRange.empty() && value >= lookup.encodeMinimum && value <= lookup.encodeMaximum) {
+    const double position = (value - lookup.encodeMinimum) /
+                            (lookup.encodeMaximum - lookup.encodeMinimum) *
+                            static_cast<double>(lookup.encodedRange.size() - 1);
+    return sampleLookup(lookup.encodedRange, position);
+  }
+  return encodeTransfer(value, spec);
+}
+
+Vec3 decodeTransferFast(const Vec3 &value, const ColorSpaceSpec &spec, const TransferLookup &lookup) {
+  return {
+    decodeTransferFast(value.r, spec, lookup),
+    decodeTransferFast(value.g, spec, lookup),
+    decodeTransferFast(value.b, spec, lookup),
+  };
+}
+
+Vec3 encodeTransferFast(const Vec3 &value, const ColorSpaceSpec &spec, const TransferLookup &lookup) {
+  return {
+    encodeTransferFast(value.r, spec, lookup),
+    encodeTransferFast(value.g, spec, lookup),
+    encodeTransferFast(value.b, spec, lookup),
+  };
+}
+
+struct PreparedColorTransform {
+  bool identity = true;
+  const ColorSpaceSpec *source = nullptr;
+  const ColorSpaceSpec *destination = nullptr;
+  const TransferLookup *sourceLookup = nullptr;
+  const TransferLookup *destinationLookup = nullptr;
+  Mat3 linearMatrix{{{1.0, 0.0, 0.0,
+                      0.0, 1.0, 0.0,
+                      0.0, 0.0, 1.0}}};
+
+  Vec3 apply(const Vec3 &value) const {
+    if (identity || !source || !destination) {
+      return value;
+    }
+    const Vec3 sourceLinear = decodeTransfer(value, *source);
+    return encodeTransfer(multiply(linearMatrix, sourceLinear), *destination);
+  }
+
+  Vec3 applyFast(const Vec3 &value) const {
+    if (identity || !source || !destination || !sourceLookup || !destinationLookup) {
+      return value;
+    }
+    const Vec3 sourceLinear = decodeTransferFast(value, *source, *sourceLookup);
+    return encodeTransferFast(multiply(linearMatrix, sourceLinear), *destination, *destinationLookup);
+  }
+};
+
+PreparedColorTransform prepareColorTransform(int sourceSpace, int destinationSpace) {
+  PreparedColorTransform transform;
+  const int source = sanitizeColorSpace(sourceSpace);
+  const int destination = sanitizeColorSpace(destinationSpace);
+  if (source == destination) {
+    return transform;
+  }
+  transform.identity = false;
+  transform.source = &colorSpaceSpec(source);
+  transform.destination = &colorSpaceSpec(destination);
+  transform.sourceLookup = &transferLookups()[static_cast<size_t>(source)];
+  transform.destinationLookup = &transferLookups()[static_cast<size_t>(destination)];
+  transform.linearMatrix = multiply(transform.destination->fromReference, transform.source->toReference);
+  return transform;
 }
 
 double clamp01(double v) {
@@ -922,43 +1085,51 @@ LutData parseCubeFile(const std::string &path) {
 struct CacheEntry {
   time_t mtime = 0;
   off_t size = 0;
-  LutData lut;
+  std::shared_ptr<const LutData> lut;
 };
 
 std::mutex gCacheMutex;
 std::unordered_map<std::string, CacheEntry> gLutCache;
 
-const LutData &identityLut() {
-  static const LutData lut;
+std::shared_ptr<const LutData> identityLut() {
+  static const std::shared_ptr<const LutData> lut = std::make_shared<const LutData>();
   return lut;
 }
 
-LutData getLut(const std::string &rawPath) {
+struct LutCacheResult {
+  std::shared_ptr<const LutData> lut = identityLut();
+  std::string revision;
+};
+
+LutCacheResult getLut(const std::string &rawPath) {
   std::string path = expandPath(rawPath);
   if (path.empty()) {
     path = readSavedLutPath();
   }
   if (path.empty()) {
-    return identityLut();
+    return {};
   }
 
   struct stat st {};
   if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-    return identityLut();
+    return {};
   }
+
+  const std::string revision = path + "|" + std::to_string(static_cast<long long>(st.st_mtime)) +
+                               "|" + std::to_string(static_cast<long long>(st.st_size));
 
   std::lock_guard<std::mutex> lock(gCacheMutex);
   auto found = gLutCache.find(path);
   if (found != gLutCache.end() && found->second.mtime == st.st_mtime && found->second.size == st.st_size) {
-    return found->second.lut;
+    return {found->second.lut, revision};
   }
 
   CacheEntry entry;
   entry.mtime = st.st_mtime;
   entry.size = st.st_size;
-  entry.lut = parseCubeFile(path);
+  entry.lut = std::make_shared<const LutData>(parseCubeFile(path));
   auto result = gLutCache.insert_or_assign(path, std::move(entry));
-  return result.first->second.lut;
+  return {result.first->second.lut, revision};
 }
 
 struct RenderParams {
@@ -984,91 +1155,149 @@ Vec3 lumaWeights(int colorSpace) { return colorSpaceSpec(colorSpace).lumaWeights
 
 double dotLuma(const Vec3 &v, const Vec3 &w) { return v.r * w.r + v.g * w.g + v.b * w.b; }
 
-Vec3 hueRotate(const Vec3 &c, double degrees) {
-  if (std::abs(degrees) < 1e-9) {
-    return c;
-  }
-
+Mat3 hueRotationMatrix(double degrees) {
   const double angle = degrees * 3.14159265358979323846 / 180.0;
   const double cosA = std::cos(angle);
   const double sinA = std::sin(angle);
-
-  return {
-    c.r * (0.213 + cosA * 0.787 - sinA * 0.213) +
-      c.g * (0.715 - cosA * 0.715 - sinA * 0.715) +
-      c.b * (0.072 - cosA * 0.072 + sinA * 0.928),
-    c.r * (0.213 - cosA * 0.213 + sinA * 0.143) +
-      c.g * (0.715 + cosA * 0.285 + sinA * 0.140) +
-      c.b * (0.072 - cosA * 0.072 - sinA * 0.283),
-    c.r * (0.213 - cosA * 0.213 - sinA * 0.787) +
-      c.g * (0.715 - cosA * 0.715 + sinA * 0.715) +
-      c.b * (0.072 + cosA * 0.928 + sinA * 0.072),
-  };
+  return {{{
+    0.213 + cosA * 0.787 - sinA * 0.213,
+    0.715 - cosA * 0.715 - sinA * 0.715,
+    0.072 - cosA * 0.072 + sinA * 0.928,
+    0.213 - cosA * 0.213 + sinA * 0.143,
+    0.715 + cosA * 0.285 + sinA * 0.140,
+    0.072 - cosA * 0.072 - sinA * 0.283,
+    0.213 - cosA * 0.213 - sinA * 0.787,
+    0.715 - cosA * 0.715 + sinA * 0.715,
+    0.072 + cosA * 0.928 + sinA * 0.072,
+  }}};
 }
 
-Vec3 applyLayeredLut(const Vec3 &lutInput,
-                     const LutData &lut,
-                     const RenderParams &params,
-                     int lutInputColorSpace,
-                     int lutOutputColorSpace) {
+bool isDefaultValue(double value, double expected) { return std::abs(value - expected) < 1e-12; }
+
+struct PreparedLayerContext {
+  RenderParams params;
+  PreparedColorTransform inputToOutput;
+  Vec3 weights;
+  Mat3 hueMatrix;
+  bool primaryMixIsDefault = false;
+  bool hueActive = false;
+  bool purityActive = false;
+  bool densityActive = false;
+  double densityGain = 1.0;
+};
+
+PreparedLayerContext prepareLayerContext(const RenderParams &params,
+                                         int lutInputColorSpace,
+                                         int lutOutputColorSpace) {
+  PreparedLayerContext context;
+  context.params = params;
+  context.inputToOutput = prepareColorTransform(lutInputColorSpace, lutOutputColorSpace);
+  context.weights = lumaWeights(lutOutputColorSpace);
+  context.primaryMixIsDefault =
+    isDefaultValue(params.lumaStrength, 1.0) &&
+    isDefaultValue(params.colorStrength, 1.0) &&
+    isDefaultValue(params.shadowStrength, 1.0) &&
+    isDefaultValue(params.midtoneStrength, 1.0) &&
+    isDefaultValue(params.highlightStrength, 1.0) &&
+    isDefaultValue(params.neutralBias, 1.0) &&
+    isDefaultValue(params.blackLevel, 1.0) &&
+    isDefaultValue(params.whiteRolloff, 1.0);
+  context.hueActive = !isDefaultValue(params.hueShift, 0.0);
+  if (context.hueActive) {
+    context.hueMatrix = hueRotationMatrix(params.hueShift);
+  }
+  context.purityActive = !isDefaultValue(params.colorPurity, 1.0);
+  context.densityActive = !isDefaultValue(params.densityOffset, 0.0);
+  if (context.densityActive) {
+    context.densityGain = std::pow(2.0, -params.densityOffset);
+  }
+  return context;
+}
+
+Vec3 applyLayeredLutPrepared(const Vec3 &lutInput,
+                             const LutData &lut,
+                             const PreparedLayerContext &context) {
   if (!lut.valid()) {
     return lutInput;
   }
 
-  const int inputSpace = sanitizeColorSpace(lutInputColorSpace);
-  const int outputSpace = sanitizeColorSpace(lutOutputColorSpace);
-  const Vec3 reference = convertColorSpace(lutInput, inputSpace, outputSpace);
-  const Vec3 weights = lumaWeights(outputSpace);
   const Vec3 lutRgb = lut.apply(lutInput);
+  Vec3 result = lutRgb;
 
-  const double srcY = dotLuma(reference, weights);
-  const double lutY = dotLuma(lutRgb, weights);
-  const Vec3 srcChroma = reference - Vec3{srcY, srcY, srcY};
-  const Vec3 lutChroma = lutRgb - Vec3{lutY, lutY, lutY};
+  if (!context.primaryMixIsDefault) {
+    const RenderParams &params = context.params;
+    const Vec3 reference = context.inputToOutput.applyFast(lutInput);
+    const double srcY = dotLuma(reference, context.weights);
+    const double lutY = dotLuma(lutRgb, context.weights);
+    const Vec3 srcChroma = reference - Vec3{srcY, srcY, srcY};
+    const Vec3 lutChroma = lutRgb - Vec3{lutY, lutY, lutY};
 
-  const double y = clamp01(srcY);
-  const double shadowMask = 1.0 - smoothstep(0.18, 0.45, y);
-  const double highlightMask = smoothstep(0.55, 0.82, y);
-  const double midMask = clamp01(1.0 - std::abs(y - 0.5) * 2.0);
-  const double maskSum = std::max(1e-6, shadowMask + midMask + highlightMask);
-  const double zoneStrength =
-    (shadowMask * params.shadowStrength + midMask * params.midtoneStrength + highlightMask * params.highlightStrength) / maskSum;
+    const double y = clamp01(srcY);
+    const double shadowMask = 1.0 - smoothstep(0.18, 0.45, y);
+    const double highlightMask = smoothstep(0.55, 0.82, y);
+    const double midMask = clamp01(1.0 - std::abs(y - 0.5) * 2.0);
+    const double maskSum = std::max(1e-6, shadowMask + midMask + highlightMask);
+    const double zoneStrength =
+      (shadowMask * params.shadowStrength + midMask * params.midtoneStrength +
+       highlightMask * params.highlightStrength) / maskSum;
 
-  const double sat = std::max({std::abs(srcChroma.r), std::abs(srcChroma.g), std::abs(srcChroma.b)});
-  const double neutralMask = 1.0 - smoothstep(0.035, 0.18, sat);
-  const double neutralScale = std::max(0.0, 1.0 + (params.neutralBias - 1.0) * neutralMask);
+    const double sat = std::max({std::abs(srcChroma.r), std::abs(srcChroma.g), std::abs(srcChroma.b)});
+    const double neutralMask = 1.0 - smoothstep(0.035, 0.18, sat);
+    const double neutralScale = std::max(0.0, 1.0 + (params.neutralBias - 1.0) * neutralMask);
 
-  double lumaDelta = (lutY - srcY) * params.lumaStrength;
-  lumaDelta *= 1.0 + (params.blackLevel - 1.0) * shadowMask;
-  lumaDelta *= 1.0 + (params.whiteRolloff - 1.0) * highlightMask;
+    double lumaDelta = (lutY - srcY) * params.lumaStrength;
+    lumaDelta *= 1.0 + (params.blackLevel - 1.0) * shadowMask;
+    lumaDelta *= 1.0 + (params.whiteRolloff - 1.0) * highlightMask;
+    const Vec3 chromaDelta = (lutChroma - srcChroma) * (params.colorStrength * neutralScale);
 
-  Vec3 chromaDelta = (lutChroma - srcChroma) * (params.colorStrength * neutralScale);
+    const double outY = srcY + lumaDelta * zoneStrength;
+    const Vec3 outChroma = srcChroma + chromaDelta * zoneStrength;
+    result = {outY + outChroma.r, outY + outChroma.g, outY + outChroma.b};
+  }
 
-  double outY = srcY + lumaDelta * zoneStrength;
-  Vec3 outChroma = srcChroma + chromaDelta * zoneStrength;
-  Vec3 result = {outY + outChroma.r, outY + outChroma.g, outY + outChroma.b};
-
-  if (std::abs(params.hueShift) > 1e-9) {
-    const double yBefore = dotLuma(result, weights);
-    Vec3 rotated = hueRotate(result, params.hueShift);
-    const double yAfter = dotLuma(rotated, weights);
+  if (context.hueActive) {
+    const double yBefore = dotLuma(result, context.weights);
+    const Vec3 rotated = multiply(context.hueMatrix, result);
+    const double yAfter = dotLuma(rotated, context.weights);
     result = rotated + Vec3{yBefore - yAfter, yBefore - yAfter, yBefore - yAfter};
   }
 
-  if (std::abs(params.colorPurity - 1.0) > 1e-9) {
-    const double finalY = dotLuma(result, weights);
-    result = Vec3{finalY, finalY, finalY} + (result - Vec3{finalY, finalY, finalY}) * params.colorPurity;
+  if (context.purityActive) {
+    const double finalY = dotLuma(result, context.weights);
+    result = Vec3{finalY, finalY, finalY} +
+             (result - Vec3{finalY, finalY, finalY}) * context.params.colorPurity;
   }
 
-  if (std::abs(params.densityOffset) > 1e-9) {
-    const double gain = std::pow(2.0, -params.densityOffset);
-    result = result * gain;
+  if (context.densityActive) {
+    result = result * context.densityGain;
   }
 
   return result;
 }
 
-Vec3 applyColorManagedLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params) {
+struct PreparedProcessor {
+  const LutData *lut = nullptr;
+  PreparedColorTransform nodeToLutInput;
+  PreparedLayerContext layer;
+  PreparedColorTransform lutOutputToNode;
+  bool returnToNodeColorSpace = true;
+  bool directLutOnly = false;
+  bool acceleratedLutIsSafe = false;
+
+  Vec3 apply(const Vec3 &src) const {
+    if (!lut || !lut->valid()) {
+      return src;
+    }
+    if (directLutOnly) {
+      return lut->apply(src);
+    }
+    const Vec3 lutInput = nodeToLutInput.applyFast(src);
+    const Vec3 lutOutput = applyLayeredLutPrepared(lutInput, *lut, layer);
+    return returnToNodeColorSpace ? lutOutputToNode.applyFast(lutOutput) : lutOutput;
+  }
+};
+
+PreparedProcessor prepareProcessor(const LutData &lut, const RenderParams &params) {
   const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
   const int lutInputSpace = params.lutInputColorSpace < 0
                               ? nodeSpace
@@ -1076,11 +1305,205 @@ Vec3 applyColorManagedLayeredLut(const Vec3 &src, const LutData &lut, const Rend
   const int lutOutputSpace = params.lutOutputColorSpace < 0
                                ? lutInputSpace
                                : sanitizeColorSpace(params.lutOutputColorSpace);
-  const Vec3 lutInput = convertColorSpace(src, nodeSpace, lutInputSpace);
-  const Vec3 lutOutput = applyLayeredLut(lutInput, lut, params, lutInputSpace, lutOutputSpace);
-  return params.returnToNodeColorSpace
-           ? convertColorSpace(lutOutput, lutOutputSpace, nodeSpace)
-           : lutOutput;
+
+  PreparedProcessor processor;
+  processor.lut = &lut;
+  processor.nodeToLutInput = prepareColorTransform(nodeSpace, lutInputSpace);
+  processor.layer = prepareLayerContext(params, lutInputSpace, lutOutputSpace);
+  processor.lutOutputToNode = prepareColorTransform(lutOutputSpace, nodeSpace);
+  processor.returnToNodeColorSpace = params.returnToNodeColorSpace;
+  processor.directLutOnly =
+    processor.nodeToLutInput.identity &&
+    processor.layer.primaryMixIsDefault &&
+    !processor.layer.hueActive &&
+    !processor.layer.purityActive &&
+    !processor.layer.densityActive &&
+    (!processor.returnToNodeColorSpace || processor.lutOutputToNode.identity);
+  processor.acceleratedLutIsSafe =
+    processor.nodeToLutInput.identity &&
+    processor.layer.inputToOutput.identity &&
+    (!processor.returnToNodeColorSpace || processor.lutOutputToNode.identity);
+  return processor;
+}
+
+[[maybe_unused]] Vec3 applyColorManagedLayeredLut(const Vec3 &src, const LutData &lut, const RenderParams &params) {
+  return prepareProcessor(lut, params).apply(src);
+}
+
+struct FastVec3 {
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+};
+
+struct AcceleratedLut {
+  int size = 0;
+  std::vector<FastVec3> values;
+
+  bool valid() const { return size > 1 && values.size() >= cubeSampleCount(size); }
+
+  Vec3 applyUnitCube(const Vec3 &rgb) const {
+    const double scale = static_cast<double>(size - 1);
+    const double x = rgb.r * scale;
+    const double y = rgb.g * scale;
+    const double z = rgb.b * scale;
+    const int x0 = static_cast<int>(x);
+    const int y0 = static_cast<int>(y);
+    const int z0 = static_cast<int>(z);
+    const int x1 = std::min(x0 + 1, size - 1);
+    const int y1 = std::min(y0 + 1, size - 1);
+    const int z1 = std::min(z0 + 1, size - 1);
+    const double tx = x - x0;
+    const double ty = y - y0;
+    const double tz = z - z0;
+
+    const auto at = [this](int r, int g, int b) {
+      const FastVec3 &sample = values[static_cast<size_t>(r + g * size + b * size * size)];
+      return Vec3{sample.r, sample.g, sample.b};
+    };
+    const Vec3 c00 = lerp(at(x0, y0, z0), at(x1, y0, z0), tx);
+    const Vec3 c10 = lerp(at(x0, y1, z0), at(x1, y1, z0), tx);
+    const Vec3 c01 = lerp(at(x0, y0, z1), at(x1, y0, z1), tx);
+    const Vec3 c11 = lerp(at(x0, y1, z1), at(x1, y1, z1), tx);
+    return lerp(lerp(c00, c10, ty), lerp(c01, c11, ty), tz);
+  }
+};
+
+unsigned int availableWorkerThreads() {
+  unsigned int count = std::max(1u, std::thread::hardware_concurrency());
+  if (gThread && gThread->multiThreadNumCPUs) {
+    unsigned int hostCount = 1;
+    if (gThread->multiThreadNumCPUs(&hostCount) == kOfxStatOK && hostCount > 0) {
+      count = std::max(count, hostCount);
+    }
+  }
+  // Keep roughly a quarter of the machine available to Resolve's decoder, UI, and other apps.
+  const unsigned int reserved = count >= 6 ? (count + 3) / 4 : 1;
+  return count > reserved ? count - reserved : 1;
+}
+
+void executeWorkers(OfxThreadFunctionV1 function, unsigned int workers, void *customArg) {
+  if (!function || workers <= 1) {
+    if (function) {
+      function(0, 1, customArg);
+    }
+    return;
+  }
+#ifdef __APPLE__
+  dispatch_apply(workers,
+                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                 ^(size_t index) {
+                   function(static_cast<unsigned int>(index), workers, customArg);
+                 });
+#else
+  std::vector<std::thread> threads;
+  threads.reserve(workers - 1);
+  for (unsigned int index = 1; index < workers; ++index) {
+    threads.emplace_back(function, index, workers, customArg);
+  }
+  function(0, workers, customArg);
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+#endif
+}
+
+struct AcceleratedLutBuildContext {
+  AcceleratedLut *destination = nullptr;
+  const PreparedProcessor *processor = nullptr;
+};
+
+void buildAcceleratedLutWorker(unsigned int threadIndex, unsigned int threadCount, void *customArg) {
+  auto *context = static_cast<AcceleratedLutBuildContext *>(customArg);
+  if (!context || !context->destination || !context->processor) {
+    return;
+  }
+  AcceleratedLut &destination = *context->destination;
+  const size_t total = destination.values.size();
+  const size_t begin = total * threadIndex / threadCount;
+  const size_t end = total * (threadIndex + 1) / threadCount;
+  const int size = destination.size;
+  const double scale = 1.0 / static_cast<double>(size - 1);
+  const size_t plane = static_cast<size_t>(size) * static_cast<size_t>(size);
+  for (size_t index = begin; index < end; ++index) {
+    const int b = static_cast<int>(index / plane);
+    const size_t remainder = index - static_cast<size_t>(b) * plane;
+    const int g = static_cast<int>(remainder / static_cast<size_t>(size));
+    const int r = static_cast<int>(remainder % static_cast<size_t>(size));
+    const Vec3 result = context->processor->apply({r * scale, g * scale, b * scale});
+    destination.values[index] = {
+      static_cast<float>(result.r),
+      static_cast<float>(result.g),
+      static_cast<float>(result.b),
+    };
+  }
+}
+
+std::shared_ptr<const AcceleratedLut> buildAcceleratedLut(const PreparedProcessor &processor, int size) {
+  auto lut = std::make_shared<AcceleratedLut>();
+  lut->size = size;
+  lut->values.resize(cubeSampleCount(size));
+  AcceleratedLutBuildContext context{lut.get(), &processor};
+  const unsigned int workers = std::min<unsigned int>(availableWorkerThreads(),
+                                                       std::max(1, size / 4));
+  executeWorkers(buildAcceleratedLutWorker, workers, &context);
+  return lut;
+}
+
+struct AcceleratedCacheEntry {
+  std::shared_ptr<const AcceleratedLut> lut;
+  uint64_t lastUsed = 0;
+};
+
+std::mutex gAcceleratedCacheMutex;
+std::unordered_map<std::string, AcceleratedCacheEntry> gAcceleratedLutCache;
+uint64_t gAcceleratedUseCounter = 0;
+
+std::string acceleratedCacheKey(const std::string &sourceRevision,
+                                const RenderParams &params,
+                                int resolution) {
+  std::ostringstream key;
+  key << sourceRevision << '|' << resolution << '|'
+      << params.nodeColorSpace << '|' << params.lutInputColorSpace << '|'
+      << params.lutOutputColorSpace << '|' << params.returnToNodeColorSpace << '|'
+      << std::hexfloat
+      << params.lumaStrength << '|' << params.colorStrength << '|'
+      << params.shadowStrength << '|' << params.midtoneStrength << '|'
+      << params.highlightStrength << '|' << params.neutralBias << '|'
+      << params.blackLevel << '|' << params.whiteRolloff << '|'
+      << params.colorPurity << '|' << params.densityOffset << '|' << params.hueShift;
+  return key.str();
+}
+
+std::shared_ptr<const AcceleratedLut> findAcceleratedLut(const std::string &key) {
+  std::lock_guard<std::mutex> lock(gAcceleratedCacheMutex);
+  const auto found = gAcceleratedLutCache.find(key);
+  if (found == gAcceleratedLutCache.end()) {
+    return {};
+  }
+  found->second.lastUsed = ++gAcceleratedUseCounter;
+  return found->second.lut;
+}
+
+void cacheAcceleratedLut(const std::string &key, std::shared_ptr<const AcceleratedLut> lut) {
+  constexpr size_t kMaximumCachedLuts = 6;
+  std::lock_guard<std::mutex> lock(gAcceleratedCacheMutex);
+  if (gAcceleratedLutCache.size() >= kMaximumCachedLuts && gAcceleratedLutCache.find(key) == gAcceleratedLutCache.end()) {
+    auto oldest = gAcceleratedLutCache.begin();
+    for (auto candidate = gAcceleratedLutCache.begin(); candidate != gAcceleratedLutCache.end(); ++candidate) {
+      if (candidate->second.lastUsed < oldest->second.lastUsed) {
+        oldest = candidate;
+      }
+    }
+    gAcceleratedLutCache.erase(oldest);
+  }
+  gAcceleratedLutCache[key] = {std::move(lut), ++gAcceleratedUseCounter};
+}
+
+bool isInsideUnitCube(const Vec3 &value) {
+  return value.r >= 0.0 && value.r <= 1.0 &&
+         value.g >= 0.0 && value.g <= 1.0 &&
+         value.b >= 0.0 && value.b <= 1.0;
 }
 
 enum class PixelDepth { Byte, Short, Float, Unsupported };
@@ -1126,6 +1549,147 @@ struct ImageInfo {
   PixelDepth depth = PixelDepth::Unsupported;
   Components components = Components::Unsupported;
 };
+
+#ifdef __APPLE__
+void setMetalVec3(std::array<float, MetalFloatParamCount> &values, size_t offset, const Vec3 &value) {
+  values[offset] = static_cast<float>(value.r);
+  values[offset + 1] = static_cast<float>(value.g);
+  values[offset + 2] = static_cast<float>(value.b);
+}
+
+void setMetalMatrix(std::array<float, MetalFloatParamCount> &values, size_t offset, const Mat3 &matrix) {
+  for (size_t i = 0; i < matrix.v.size(); ++i) {
+    values[offset + i] = static_cast<float>(matrix.v[i]);
+  }
+}
+
+void setMetalCurve(std::array<float, MetalFloatParamCount> &values,
+                   size_t offset,
+                   const CameraLogCurve &curve) {
+  values[offset] = static_cast<float>(curve.base);
+  values[offset + 1] = static_cast<float>(curve.linSideSlope);
+  values[offset + 2] = static_cast<float>(curve.linSideOffset);
+  values[offset + 3] = static_cast<float>(curve.logSideSlope);
+  values[offset + 4] = static_cast<float>(curve.logSideOffset);
+  values[offset + 5] = static_cast<float>(curve.linSideBreak);
+  values[offset + 6] = static_cast<float>(curve.linearSlope);
+  values[offset + 7] = static_cast<float>(curve.linearOffset);
+  values[offset + 8] = static_cast<float>(curve.logSideBreak);
+}
+
+int metalPixelDepth(PixelDepth depth) {
+  switch (depth) {
+    case PixelDepth::Byte:
+      return 0;
+    case PixelDepth::Short:
+      return 1;
+    case PixelDepth::Float:
+      return 2;
+    default:
+      return -1;
+  }
+}
+
+bool executeMetalRender(void *commandQueue,
+                        const ImageInfo &source,
+                        const ImageInfo &destination,
+                        bool hasSource,
+                        int x1,
+                        int y1,
+                        int x2,
+                        int y2,
+                        const std::string &lutRevision,
+                        const LutData &lut,
+                        const RenderParams &params,
+                        const PreparedProcessor &processor) {
+  static_assert(sizeof(Vec3) == sizeof(double) * 3, "Vec3 must be tightly packed for Metal LUT upload");
+  if (!commandQueue || !destination.data || x2 <= x1 || y2 <= y1 ||
+      destination.rowBytes <= 0 || metalPixelDepth(destination.depth) < 0 ||
+      (hasSource && (source.depth != destination.depth || source.rowBytes <= 0))) {
+    return false;
+  }
+
+  const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
+  const int inputSpace = params.lutInputColorSpace < 0
+                           ? nodeSpace
+                           : sanitizeColorSpace(params.lutInputColorSpace);
+  const int outputSpace = params.lutOutputColorSpace < 0
+                            ? inputSpace
+                            : sanitizeColorSpace(params.lutOutputColorSpace);
+  const ColorSpaceSpec &nodeSpec = colorSpaceSpec(nodeSpace);
+  const ColorSpaceSpec &inputSpec = colorSpaceSpec(inputSpace);
+  const ColorSpaceSpec &outputSpec = colorSpaceSpec(outputSpace);
+
+  MetalRenderRequest request;
+  request.commandQueue = commandQueue;
+  request.sourceBuffer = hasSource ? source.data : nullptr;
+  request.destinationBuffer = destination.data;
+  request.lutRevision = lutRevision;
+  request.lut.values = lut.values.empty() ? nullptr : reinterpret_cast<const double *>(lut.values.data());
+  request.lut.valueCount = lut.values.size();
+  request.lut.shaperValues = lut.shaperValues.empty()
+                                ? nullptr
+                                : reinterpret_cast<const double *>(lut.shaperValues.data());
+  request.lut.shaperValueCount = lut.shaperValues.size();
+
+  auto &integers = request.integers;
+  integers[MetalRenderX] = x1;
+  integers[MetalRenderY] = y1;
+  integers[MetalRenderWidth] = x2 - x1;
+  integers[MetalRenderHeight] = y2 - y1;
+  integers[MetalSourceX1] = source.bounds[0];
+  integers[MetalSourceY1] = source.bounds[1];
+  integers[MetalSourceX2] = source.bounds[2];
+  integers[MetalSourceY2] = source.bounds[3];
+  integers[MetalDestinationX1] = destination.bounds[0];
+  integers[MetalDestinationY1] = destination.bounds[1];
+  integers[MetalSourceRowBytes] = source.rowBytes;
+  integers[MetalDestinationRowBytes] = destination.rowBytes;
+  integers[MetalSourceComponents] = hasSource ? componentCount(source.components) : 4;
+  integers[MetalDestinationComponents] = componentCount(destination.components);
+  integers[MetalPixelDepth] = metalPixelDepth(destination.depth);
+  integers[MetalHasSource] = hasSource ? 1 : 0;
+  integers[MetalLutType] = lut.valid() ? static_cast<int>(lut.type) : 0;
+  integers[MetalLutSize] = lut.size;
+  integers[MetalShaperSize] = lut.shaperSize;
+  integers[MetalLutOffset] = lut.type == LutData::Type::Lut1DThen3D ? lut.shaperSize : 0;
+  integers[MetalNodeTransfer] = static_cast<int>(nodeSpec.transfer);
+  integers[MetalInputTransfer] = static_cast<int>(inputSpec.transfer);
+  integers[MetalOutputTransfer] = static_cast<int>(outputSpec.transfer);
+  integers[MetalReturnToNode] = processor.returnToNodeColorSpace ? 1 : 0;
+  integers[MetalPrimaryMixIsDefault] = processor.layer.primaryMixIsDefault ? 1 : 0;
+  integers[MetalHueActive] = processor.layer.hueActive ? 1 : 0;
+  integers[MetalPurityActive] = processor.layer.purityActive ? 1 : 0;
+  integers[MetalDensityActive] = processor.layer.densityActive ? 1 : 0;
+  integers[MetalDirectLutOnly] = processor.directLutOnly ? 1 : 0;
+  integers[MetalNodeToInputIdentity] = processor.nodeToLutInput.identity ? 1 : 0;
+  integers[MetalInputToOutputIdentity] = processor.layer.inputToOutput.identity ? 1 : 0;
+  integers[MetalOutputToNodeIdentity] = processor.lutOutputToNode.identity ? 1 : 0;
+
+  auto &floats = request.floats;
+  setMetalVec3(floats, MetalDomainMinimum, lut.domainMin);
+  setMetalVec3(floats, MetalDomainMaximum, lut.domainMax);
+  setMetalVec3(floats, MetalLumaWeights, processor.layer.weights);
+  floats[MetalLumaStrength] = static_cast<float>(params.lumaStrength);
+  floats[MetalColorStrength] = static_cast<float>(params.colorStrength);
+  floats[MetalShadowStrength] = static_cast<float>(params.shadowStrength);
+  floats[MetalMidtoneStrength] = static_cast<float>(params.midtoneStrength);
+  floats[MetalHighlightStrength] = static_cast<float>(params.highlightStrength);
+  floats[MetalNeutralBias] = static_cast<float>(params.neutralBias);
+  floats[MetalBlackLevel] = static_cast<float>(params.blackLevel);
+  floats[MetalWhiteRolloff] = static_cast<float>(params.whiteRolloff);
+  floats[MetalColorPurity] = static_cast<float>(params.colorPurity);
+  floats[MetalDensityGain] = static_cast<float>(processor.layer.densityGain);
+  setMetalMatrix(floats, MetalHueMatrix, processor.layer.hueMatrix);
+  setMetalMatrix(floats, MetalNodeToInputMatrix, processor.nodeToLutInput.linearMatrix);
+  setMetalMatrix(floats, MetalInputToOutputMatrix, processor.layer.inputToOutput.linearMatrix);
+  setMetalMatrix(floats, MetalOutputToNodeMatrix, processor.lutOutputToNode.linearMatrix);
+  setMetalCurve(floats, MetalNodeCurve, nodeSpec.log);
+  setMetalCurve(floats, MetalInputCurve, inputSpec.log);
+  setMetalCurve(floats, MetalOutputCurve, outputSpec.log);
+  return runMetalRender(request);
+}
+#endif
 
 bool getImageInfo(OfxPropertySetHandle image, ImageInfo &info) {
   if (!image || !gProp) {
@@ -1263,6 +1827,129 @@ void writePixel(const ImageInfo &image, int x, int y, const Vec4 &value) {
   }
 }
 
+struct RenderWork {
+  OfxImageEffectHandle effect = nullptr;
+  ImageInfo source;
+  ImageInfo destination;
+  bool hasSource = false;
+  int x1 = 0;
+  int y1 = 0;
+  int x2 = 0;
+  int y2 = 0;
+  const LutData *lut = nullptr;
+  const PreparedProcessor *processor = nullptr;
+  const AcceleratedLut *acceleratedLut = nullptr;
+  std::atomic<bool> cancelled{false};
+};
+
+Vec3 processRenderColor(const Vec3 &source, const RenderWork &work) {
+  if (!work.lut || !work.lut->valid() || !work.processor) {
+    return source;
+  }
+  if (work.acceleratedLut && isInsideUnitCube(source)) {
+    return work.acceleratedLut->applyUnitCube(source);
+  }
+  return work.processor->apply(source);
+}
+
+bool renderShouldAbort(RenderWork &work, int y, int firstRow) {
+  if (work.cancelled.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  if (((y - firstRow) & 7) == 0 && gEffect->abort(work.effect)) {
+    work.cancelled.store(true, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+template <typename T>
+void processTypedRows(RenderWork &work, int firstRow, int lastRow) {
+  const int sourceComponents = componentCount(work.source.components);
+  const int destinationComponents = componentCount(work.destination.components);
+  for (int y = firstRow; y < lastRow; ++y) {
+    if (renderShouldAbort(work, y, firstRow)) {
+      break;
+    }
+
+    const bool sourceRowAvailable = work.hasSource &&
+                                    y >= work.source.bounds[1] && y < work.source.bounds[3];
+    const T *sourceRow = sourceRowAvailable
+                           ? reinterpret_cast<const T *>(static_cast<const char *>(work.source.data) +
+                               static_cast<ptrdiff_t>(y - work.source.bounds[1]) * work.source.rowBytes)
+                           : nullptr;
+    auto *destinationRow = reinterpret_cast<T *>(static_cast<char *>(work.destination.data) +
+                            static_cast<ptrdiff_t>(y - work.destination.bounds[1]) * work.destination.rowBytes);
+
+    for (int x = work.x1; x < work.x2; ++x) {
+      Vec4 source;
+      if (sourceRow && x >= work.source.bounds[0] && x < work.source.bounds[2]) {
+        const T *pixel = sourceRow + static_cast<ptrdiff_t>(x - work.source.bounds[0]) * sourceComponents;
+        source.r = readNorm<T>(pixel[0]);
+        source.g = readNorm<T>(pixel[1]);
+        source.b = readNorm<T>(pixel[2]);
+        source.a = work.source.components == Components::RGBA ? readNorm<T>(pixel[3]) : 1.0;
+      }
+
+      const Vec3 result = processRenderColor({source.r, source.g, source.b}, work);
+      T *destination = destinationRow + static_cast<ptrdiff_t>(x - work.destination.bounds[0]) * destinationComponents;
+      destination[0] = writeNorm<T>(result.r);
+      destination[1] = writeNorm<T>(result.g);
+      destination[2] = writeNorm<T>(result.b);
+      if (work.destination.components == Components::RGBA) {
+        destination[3] = writeNorm<T>(source.a);
+      }
+    }
+  }
+}
+
+void processGenericRows(RenderWork &work, int firstRow, int lastRow) {
+  for (int y = firstRow; y < lastRow; ++y) {
+    if (renderShouldAbort(work, y, firstRow)) {
+      break;
+    }
+    for (int x = work.x1; x < work.x2; ++x) {
+      const Vec4 source = work.hasSource ? readPixel(work.source, x, y) : Vec4{};
+      const Vec3 result = processRenderColor({source.r, source.g, source.b}, work);
+      writePixel(work.destination, x, y, {result.r, result.g, result.b, source.a});
+    }
+  }
+}
+
+void renderRowsWorker(unsigned int threadIndex, unsigned int threadCount, void *customArg) {
+  auto *work = static_cast<RenderWork *>(customArg);
+  if (!work) {
+    return;
+  }
+  const int height = work->y2 - work->y1;
+  const int firstRow = work->y1 + static_cast<int>(static_cast<int64_t>(height) * threadIndex / threadCount);
+  const int lastRow = work->y1 + static_cast<int>(static_cast<int64_t>(height) * (threadIndex + 1) / threadCount);
+  const bool matchingDepth = !work->hasSource || work->source.depth == work->destination.depth;
+  if (matchingDepth) {
+    switch (work->destination.depth) {
+      case PixelDepth::Byte:
+        processTypedRows<uint8_t>(*work, firstRow, lastRow);
+        return;
+      case PixelDepth::Short:
+        processTypedRows<uint16_t>(*work, firstRow, lastRow);
+        return;
+      case PixelDepth::Float:
+        processTypedRows<float>(*work, firstRow, lastRow);
+        return;
+      default:
+        break;
+    }
+  }
+  processGenericRows(*work, firstRow, lastRow);
+}
+
+void executeRenderRows(RenderWork &work) {
+  const int height = work.y2 - work.y1;
+  const unsigned int rowLimitedThreads = static_cast<unsigned int>(std::max(1, (height + 31) / 32));
+  const unsigned int workers = std::min(availableWorkerThreads(), rowLimitedThreads);
+  executeWorkers(renderRowsWorker, workers, &work);
+}
+
 void setLabels(OfxPropertySetHandle props, const char *label, const char *shortLabel = nullptr, const char *longLabel = nullptr) {
   if (!props || !gProp) {
     return;
@@ -1361,6 +2048,10 @@ OfxStatus describe(OfxImageEffectHandle effect) {
   gProp->propSetInt(props, kOfxImageEffectPropSupportsTiles, 0, 0);
   gProp->propSetInt(props, kOfxImageEffectPropSupportsMultiResolution, 0, 1);
   gProp->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0);
+#ifdef __APPLE__
+  gProp->propSetString(props, kOfxImageEffectPropMetalRenderSupported, 0, "true");
+#endif
+  gProp->propSetString(props, kOfxImageEffectPropNoSpatialAwareness, 0, "true");
   gProp->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
   gProp->propSetString(props, kOfxImageEffectPropSupportedContexts, 1, kOfxImageEffectContextGeneral);
   gProp->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthByte);
@@ -1625,12 +2316,22 @@ OfxStatus getRegionOfDefinition(OfxImageEffectHandle effect, OfxPropertySetHandl
 OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
   double time = 0.0;
   int window[4] = {0, 0, 0, 0};
+#ifdef __APPLE__
+  int metalEnabled = 0;
+  void *metalCommandQueue = nullptr;
+#endif
   if (gProp->propGetDouble(inArgs, kOfxPropTime, 0, &time) != kOfxStatOK) {
     return kOfxStatFailed;
   }
   if (gProp->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, window) != kOfxStatOK) {
     return kOfxStatFailed;
   }
+#ifdef __APPLE__
+  if (gProp->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &metalEnabled) == kOfxStatOK &&
+      metalEnabled != 0) {
+    gProp->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &metalCommandQueue);
+  }
+#endif
 
   OfxImageClipHandle srcClip = nullptr;
   OfxImageClipHandle dstClip = nullptr;
@@ -1668,22 +2369,60 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
   const int y2 = std::min(window[3], dstInfo.bounds[3]);
 
   const RenderParams params = readRenderParams(effect, time);
-  const LutData lut = getLut(params.cubePath);
+  const LutCacheResult cachedLut = getLut(params.cubePath);
+  const LutData &lut = *cachedLut.lut;
+  const PreparedProcessor processor = prepareProcessor(lut, params);
 
-  for (int y = y1; y < y2; ++y) {
-    if ((y & 31) == 0 && gEffect->abort(effect)) {
-      break;
+#ifdef __APPLE__
+  if (metalEnabled != 0) {
+    const bool rendered = executeMetalRender(metalCommandQueue,
+                                             srcInfo,
+                                             dstInfo,
+                                             hasSource,
+                                             x1,
+                                             y1,
+                                             x2,
+                                             y2,
+                                             cachedLut.revision,
+                                             lut,
+                                             params,
+                                             processor);
+    if (srcImage) {
+      gEffect->clipReleaseImage(srcImage);
     }
-    for (int x = x1; x < x2; ++x) {
-      Vec4 src = hasSource ? readPixel(srcInfo, x, y) : Vec4{};
-      if (!lut.valid()) {
-        writePixel(dstInfo, x, y, src);
-        continue;
+    gEffect->clipReleaseImage(dstImage);
+    return rendered ? kOfxStatOK : kOfxStatGPURenderFailed;
+  }
+#endif
+
+  constexpr int kAcceleratedLutResolution = 65;
+  constexpr int64_t kMinimumPixelsForAcceleratedBuild = 200000;
+  std::shared_ptr<const AcceleratedLut> accelerated;
+  if (lut.valid() && !processor.directLutOnly && processor.acceleratedLutIsSafe) {
+    const std::string key = acceleratedCacheKey(cachedLut.revision, params, kAcceleratedLutResolution);
+    accelerated = findAcceleratedLut(key);
+    const int64_t pixelCount = static_cast<int64_t>(std::max(0, x2 - x1)) * std::max(0, y2 - y1);
+    if (!accelerated && pixelCount >= kMinimumPixelsForAcceleratedBuild) {
+      accelerated = buildAcceleratedLut(processor, kAcceleratedLutResolution);
+      if (accelerated && accelerated->valid()) {
+        cacheAcceleratedLut(key, accelerated);
       }
-      Vec3 layered = applyColorManagedLayeredLut({src.r, src.g, src.b}, lut, params);
-      writePixel(dstInfo, x, y, {layered.r, layered.g, layered.b, src.a});
     }
   }
+
+  RenderWork work;
+  work.effect = effect;
+  work.source = srcInfo;
+  work.destination = dstInfo;
+  work.hasSource = hasSource;
+  work.x1 = x1;
+  work.y1 = y1;
+  work.x2 = x2;
+  work.y2 = y2;
+  work.lut = &lut;
+  work.processor = &processor;
+  work.acceleratedLut = accelerated.get();
+  executeRenderRows(work);
 
   if (srcImage) {
     gEffect->clipReleaseImage(srcImage);
@@ -1700,6 +2439,7 @@ OfxStatus onLoad() {
   gProp = reinterpret_cast<OfxPropertySuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxPropertySuite, 1)));
   gEffect = reinterpret_cast<OfxImageEffectSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxImageEffectSuite, 1)));
   gParam = reinterpret_cast<OfxParameterSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxParameterSuite, 1)));
+  gThread = reinterpret_cast<OfxMultiThreadSuiteV1 *>(const_cast<void *>(gHost->fetchSuite(gHost->host, kOfxMultiThreadSuite, 1)));
 
   if (!gProp || !gEffect || !gParam) {
     return kOfxStatFailed;
@@ -1708,8 +2448,17 @@ OfxStatus onLoad() {
 }
 
 OfxStatus onUnload() {
-  std::lock_guard<std::mutex> lock(gCacheMutex);
-  gLutCache.clear();
+  {
+    std::lock_guard<std::mutex> lock(gCacheMutex);
+    gLutCache.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(gAcceleratedCacheMutex);
+    gAcceleratedLutCache.clear();
+  }
+#ifdef __APPLE__
+  resetMetalRenderCaches();
+#endif
   return kOfxStatOK;
 }
 
@@ -1742,8 +2491,9 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
   if (inArgs) {
     gProp->propGetString(inArgs, kOfxPropName, 0, &changedName);
   }
+  const std::string changed = changedName ? changedName : "";
 
-  if (changedName && std::string(changedName) == kParamCubeChoice) {
+  if (changed == kParamCubeChoice) {
     OfxParamSetHandle paramSet = nullptr;
     if (gEffect->getParamSet(effect, &paramSet) == kOfxStatOK && paramSet) {
       std::vector<std::string> history = readLutHistory();
@@ -1771,7 +2521,7 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
         }
       }
     }
-  } else if (changedName && std::string(changedName) == kParamCubePath) {
+  } else if (changed == kParamCubePath) {
     OfxParamSetHandle paramSet = nullptr;
     if (gEffect->getParamSet(effect, &paramSet) == kOfxStatOK && paramSet) {
       const std::string current = getCurrentStringParam(paramSet, kParamCubePath);
@@ -1783,8 +2533,19 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     }
   }
 
-  std::lock_guard<std::mutex> lock(gCacheMutex);
-  gLutCache.clear();
+  if (changed == kParamCubeChoice || changed == kParamCubePath) {
+    {
+      std::lock_guard<std::mutex> lock(gCacheMutex);
+      gLutCache.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(gAcceleratedCacheMutex);
+      gAcceleratedLutCache.clear();
+    }
+#ifdef __APPLE__
+    resetMetalRenderCaches();
+#endif
+  }
   return kOfxStatOK;
 }
 

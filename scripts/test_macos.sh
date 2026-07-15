@@ -17,7 +17,9 @@ clang++ \
   -fobjc-arc \
   -fblocks \
   "$ROOT_DIR/tests/LutLayerManagerTests.cpp" \
+  "$ROOT_DIR/src/LUTLayerManagerMetal.mm" \
   -framework Cocoa \
+  -framework Metal \
   -weak_framework UniformTypeIdentifiers \
   -o "$TEST_BIN"
 

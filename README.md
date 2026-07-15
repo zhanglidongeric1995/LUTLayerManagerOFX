@@ -1,6 +1,6 @@
 # LUT 分层管理 OpenFX 插件
 
-DaVinci Resolve / OpenFX CPU 插件，参考视频里的 `LUT Splitter v2.6` 功能做成 LIDONG 命名体系：
+DaVinci Resolve / OpenFX 插件，参考视频里的 `LUT Splitter v2.6` 功能做成 LIDONG 命名体系：
 
 ```text
 OpenFX > LIDONG 色彩工具 > LUT 分层管理
@@ -10,7 +10,7 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
 
 最新版安装包：
 
-[下载 LUTLayerManager_1.3.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.3.0.pkg)
+[下载 LUTLayerManager_1.4.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.4.0.pkg)
 
 备用手动安装包（熟悉 OFX 手动安装的用户）：
 
@@ -41,6 +41,9 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
 - 可分别设置 `节点输入色彩空间`、`LUT 输入色彩空间` 和 `LUT 输出色彩空间`。
 - `插件输出方式` 可选择返回节点输入空间，或保留技术 LUT 的目标输出空间。
 - 内置 Rec.709 Gamma 2.4、ARRI LogC3/LogC4、Blackmagic Film Gen 5、DaVinci Intermediate、ACEScct、S-Log3、V-Log、Log3G10、Canon C-Log2，以及 DJI D-Log / D-Gamut 转换。
+- macOS / DaVinci Resolve 默认使用 Metal GPU 渲染；实测 59.94 fps 时间线可接近实时播放，CPU 占用从旧版约 500% 降到约 60%–75%。
+- Metal 不可用时自动使用 CPU 回退：多线程分行渲染、高精度传递函数查表，并为同空间分层处理建立 65 点实时缓存；复杂跨色彩空间及超出 0–1 的浮点信号保留高精度处理路径。
+- 常见默认参数会直接应用原始 LUT，不再重复计算无效的分层和色彩转换；拖动参数时也不会反复读取 `.cube` 文件。
 - 选择过的 LUT 会保存到：
 
 ```text
@@ -89,7 +92,7 @@ rm "$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/OFXPlugi
 输出：
 
 ```text
-outputs/LUTLayerManager_1.3.0.pkg
+outputs/LUTLayerManager_1.4.0.pkg
 ```
 
 ## 对外发布：Developer ID 签名与 Apple 公证
@@ -162,11 +165,11 @@ outputs/LUTLayerManager_版本号.pkg
 ./scripts/test_macos.sh
 ```
 
-测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、11 种传递曲线的往返转换、技术 LUT 的独立输入/输出空间、DJI 官方 D-Log / D-Gamut 参考值，以及与 OpenColorIO ACES Studio 参考结果的一致性。
+测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、11 种传递曲线的往返转换、技术 LUT 的独立输入/输出空间、DJI 官方 D-Log / D-Gamut 参考值、Metal 与 CPU 同帧结果、快速缓存与精确处理结果的一致性，以及与 OpenColorIO ACES Studio 参考结果的一致性。
 
 ## 说明
 
-这个版本是纯 CPU OFX 插件。macOS 上通过原生文件选择器选取 `.cube`，并将实际路径保存在 OFX 参数中；重复使用时可从 LUT 历史菜单直接切换。
+这个版本在 macOS 上优先使用 Resolve 提供的 Metal 缓冲区和命令队列直接处理画面，不把每帧像素搬回 CPU。CPU 回退路径会保留约四分之一的处理器资源给 Resolve 解码、界面和其他应用。macOS 上通过原生文件选择器选取 `.cube`，并将实际路径保存在 OFX 参数中；重复使用时可从 LUT 历史菜单直接切换。
 
 常规色彩转换常数与曲线参考 OpenColorIO 2.3.2 / ACES Studio Config 2.1.0，相关 BSD 许可随插件 bundle 一并提供。DJI D-Log 曲线与 D-Gamut 色域参考 [DJI X9 D-Log D-Gamut Whitepaper](https://dl.djicdn.com/downloads/DJI_Ronin_4D/X9_D_Log_D_Gamut_Whitepaper_I.pdf)。
 

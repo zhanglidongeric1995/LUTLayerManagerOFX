@@ -31,6 +31,8 @@ COMMON_FLAGS=(
   -Wl,-undefined,dynamic_lookup
   -framework
   Cocoa
+  -framework
+  Metal
   -weak_framework
   UniformTypeIdentifiers
 )
@@ -39,8 +41,10 @@ TMP_ARM="$BUILD_DIR/LUTLayerManager_arm64.ofx"
 TMP_X64="$BUILD_DIR/LUTLayerManager_x86_64.ofx"
 FINAL_BIN="$BIN_DIR/LUTLayerManager.ofx"
 
-clang++ "${COMMON_FLAGS[@]}" -arch arm64 "$ROOT_DIR/src/LUTLayerManager.cpp" -o "$TMP_ARM"
-clang++ "${COMMON_FLAGS[@]}" -arch x86_64 "$ROOT_DIR/src/LUTLayerManager.cpp" -o "$TMP_X64"
+clang++ "${COMMON_FLAGS[@]}" -arch arm64 \
+  "$ROOT_DIR/src/LUTLayerManager.cpp" "$ROOT_DIR/src/LUTLayerManagerMetal.mm" -o "$TMP_ARM"
+clang++ "${COMMON_FLAGS[@]}" -arch x86_64 \
+  "$ROOT_DIR/src/LUTLayerManager.cpp" "$ROOT_DIR/src/LUTLayerManagerMetal.mm" -o "$TMP_X64"
 lipo -create "$TMP_ARM" "$TMP_X64" -output "$FINAL_BIN"
 chmod 755 "$FINAL_BIN"
 

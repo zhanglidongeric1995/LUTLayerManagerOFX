@@ -1,11 +1,17 @@
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#import <Metal/Metal.h>
+#endif
 
 #include "../src/LUTLayerManager.cpp"
 
@@ -206,7 +212,7 @@ void testIdentityLutPreservesColorAcrossWorkingSpaces() {
 
   const Vec3 source{0.336, 0.336, 0.336};
   const Vec3 result = applyColorManagedLayeredLut(source, lut, params);
-  requireColorNear(result, source, 2e-8,
+  requireColorNear(result, source, 1e-4,
                    "An identity LUT should preserve color when converting into and out of its working space");
 }
 
@@ -273,8 +279,261 @@ void testTechnicalLutInputAndOutputSpaces() {
   const Vec3 expectedReturned = convertColorSpace(expectedLutOutput,
                                                   static_cast<int>(ColorSpaceId::Rec709Gamma24),
                                                   static_cast<int>(ColorSpaceId::DjiDLog));
-  requireColorNear(returnedOutput, expectedReturned, 1e-9,
+  requireColorNear(returnedOutput, expectedReturned, 1e-4,
                    "Color-managed mode should convert the declared LUT output back to the node space");
+}
+
+LutData makeBenchmarkLut(int size) {
+  LutData lut;
+  lut.type = LutData::Type::Lut3D;
+  lut.size = size;
+  lut.values.reserve(cubeSampleCount(size));
+  for (int b = 0; b < size; ++b) {
+    for (int g = 0; g < size; ++g) {
+      for (int r = 0; r < size; ++r) {
+        const double rf = static_cast<double>(r) / (size - 1);
+        const double gf = static_cast<double>(g) / (size - 1);
+        const double bf = static_cast<double>(b) / (size - 1);
+        lut.values.push_back({std::pow(rf, 0.92), std::pow(gf, 1.04), std::pow(bf, 1.08)});
+      }
+    }
+  }
+  return lut;
+}
+
+void testPreparedColorTransformsMatchReference() {
+  const Vec3 sample{0.27, 0.43, 0.61};
+  double maximumFastError = 0.0;
+  for (int source = 0; source < kColorSpaceCount; ++source) {
+    for (int destination = 0; destination < kColorSpaceCount; ++destination) {
+      const PreparedColorTransform transform = prepareColorTransform(source, destination);
+      const Vec3 expected = convertColorSpace(sample, source, destination);
+      const Vec3 actual = transform.apply(sample);
+      requireColorNear(actual, expected, 1e-11,
+                       "Prepared color transform should match the reference conversion");
+
+      for (int i = 0; i < 256; ++i) {
+        const Vec3 value{
+          -0.05 + 1.1 * static_cast<double>((i * 17) % 251) / 250.0,
+          -0.05 + 1.1 * static_cast<double>((i * 37) % 241) / 240.0,
+          -0.05 + 1.1 * static_cast<double>((i * 67) % 239) / 238.0,
+        };
+        const Vec3 exact = transform.apply(value);
+        const Vec3 fast = transform.applyFast(value);
+        maximumFastError = std::max({maximumFastError,
+                                     std::abs(exact.r - fast.r),
+                                     std::abs(exact.g - fast.g),
+                                     std::abs(exact.b - fast.b)});
+      }
+    }
+  }
+  require(maximumFastError < 3e-4,
+          "Fast transfer lookup should remain visually lossless; error was " +
+            std::to_string(maximumFastError));
+}
+
+void testAcceleratedLutMatchesPreparedProcessor() {
+  const LutData lut = makeBenchmarkLut(33);
+  RenderParams params;
+  params.nodeColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  params.returnToNodeColorSpace = true;
+  params.lumaStrength = 0.86;
+  params.colorStrength = 1.12;
+  params.shadowStrength = 0.9;
+  params.midtoneStrength = 1.05;
+  params.highlightStrength = 0.82;
+  params.neutralBias = 0.93;
+  params.colorPurity = 1.04;
+  params.hueShift = 2.0;
+
+  const PreparedProcessor processor = prepareProcessor(lut, params);
+  const std::shared_ptr<const AcceleratedLut> accelerated = buildAcceleratedLut(processor, 65);
+  require(accelerated && accelerated->valid(), "Accelerated LUT should build successfully");
+
+  double maximumError = 0.0;
+  for (int i = 0; i < 2000; ++i) {
+    const Vec3 source{
+      0.12 + 0.76 * static_cast<double>((i * 17) % 997) / 996.0,
+      0.12 + 0.76 * static_cast<double>((i * 37) % 991) / 990.0,
+      0.12 + 0.76 * static_cast<double>((i * 67) % 983) / 982.0,
+    };
+    const Vec3 exact = processor.apply(source);
+    const Vec3 fast = accelerated->applyUnitCube(source);
+    maximumError = std::max({maximumError,
+                             std::abs(exact.r - fast.r),
+                             std::abs(exact.g - fast.g),
+                             std::abs(exact.b - fast.b)});
+  }
+  require(maximumError < 0.0002,
+          "Accelerated LUT should stay visually close to the exact processor; error was " +
+            std::to_string(maximumError));
+  require(!isInsideUnitCube({-0.01, 0.5, 0.5}) && !isInsideUnitCube({0.5, 1.01, 0.5}),
+          "Out-of-range float pixels should use the exact fallback path");
+
+  RenderParams technicalParams;
+  technicalParams.nodeColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  technicalParams.lutInputColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  technicalParams.lutOutputColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  technicalParams.returnToNodeColorSpace = false;
+  technicalParams.lumaStrength = 0.779;
+  const PreparedProcessor technicalProcessor = prepareProcessor(lut, technicalParams);
+  require(!technicalProcessor.acceleratedLutIsSafe,
+          "Technical output transforms should stay on the high-precision transfer lookup path");
+}
+
+#ifdef __APPLE__
+void testMetalProcessorMatchesCpu() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) {
+    return;
+  }
+  id<MTLCommandQueue> queue = [device newCommandQueue];
+  require(queue != nil, "Metal command queue should be available");
+
+  constexpr int width = 64;
+  constexpr int height = 32;
+  std::vector<float> source(static_cast<size_t>(width * height * 4));
+  for (int i = 0; i < width * height; ++i) {
+    source[static_cast<size_t>(i * 4)] = 0.03f + 0.94f * static_cast<float>((i * 17) % 997) / 996.0f;
+    source[static_cast<size_t>(i * 4 + 1)] = 0.03f + 0.94f * static_cast<float>((i * 37) % 991) / 990.0f;
+    source[static_cast<size_t>(i * 4 + 2)] = 0.03f + 0.94f * static_cast<float>((i * 67) % 983) / 982.0f;
+    source[static_cast<size_t>(i * 4 + 3)] = 0.25f + 0.75f * static_cast<float>(i % 31) / 30.0f;
+  }
+  id<MTLBuffer> sourceBuffer = [device newBufferWithBytes:source.data()
+                                                     length:source.size() * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+  id<MTLBuffer> destinationBuffer = [device newBufferWithLength:source.size() * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+  require(sourceBuffer != nil && destinationBuffer != nil, "Metal image buffers should allocate");
+
+  ImageInfo sourceInfo;
+  sourceInfo.data = (__bridge void *)sourceBuffer;
+  sourceInfo.bounds[2] = width;
+  sourceInfo.bounds[3] = height;
+  sourceInfo.rowBytes = width * 4 * static_cast<int>(sizeof(float));
+  sourceInfo.depth = PixelDepth::Float;
+  sourceInfo.components = Components::RGBA;
+  ImageInfo destinationInfo = sourceInfo;
+  destinationInfo.data = (__bridge void *)destinationBuffer;
+
+  const LutData lut = makeBenchmarkLut(33);
+  RenderParams params;
+  params.nodeColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  params.returnToNodeColorSpace = false;
+  params.lumaStrength = 0.779;
+  params.colorStrength = 1.08;
+  params.shadowStrength = 0.92;
+  params.midtoneStrength = 1.04;
+  params.highlightStrength = 0.83;
+  params.neutralBias = 0.94;
+  params.blackLevel = 1.03;
+  params.whiteRolloff = 0.96;
+  params.colorPurity = 1.02;
+  params.densityOffset = 0.03;
+  params.hueShift = 1.5;
+  const PreparedProcessor processor = prepareProcessor(lut, params);
+
+  resetMetalRenderCaches();
+  require(executeMetalRender((__bridge void *)queue,
+                             sourceInfo,
+                             destinationInfo,
+                             true,
+                             0,
+                             0,
+                             width,
+                             height,
+                             "metal-test-lut",
+                             lut,
+                             params,
+                             processor),
+          "Metal render should be submitted");
+  id<MTLCommandBuffer> barrier = [queue commandBuffer];
+  [barrier commit];
+  [barrier waitUntilCompleted];
+  require(barrier.status == MTLCommandBufferStatusCompleted, "Metal render should complete");
+
+  const float *output = static_cast<const float *>(destinationBuffer.contents);
+  double maximumError = 0.0;
+  for (int i = 0; i < width * height; ++i) {
+    const Vec3 exact = processor.apply({source[static_cast<size_t>(i * 4)],
+                                        source[static_cast<size_t>(i * 4 + 1)],
+                                        source[static_cast<size_t>(i * 4 + 2)]});
+    maximumError = std::max({maximumError,
+                             std::abs(exact.r - output[static_cast<size_t>(i * 4)]),
+                             std::abs(exact.g - output[static_cast<size_t>(i * 4 + 1)]),
+                             std::abs(exact.b - output[static_cast<size_t>(i * 4 + 2)]),
+                             std::abs(static_cast<double>(source[static_cast<size_t>(i * 4 + 3)] -
+                                                          output[static_cast<size_t>(i * 4 + 3)]))});
+  }
+  require(maximumError < 5e-4,
+          "Metal and CPU processing should match; error was " + std::to_string(maximumError));
+  resetMetalRenderCaches();
+}
+#endif
+
+void runPerformanceBenchmark() {
+  constexpr int pixelCount = 1000000;
+  const LutData lut = makeBenchmarkLut(33);
+  RenderParams complexParams;
+  complexParams.nodeColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  complexParams.lutInputColorSpace = static_cast<int>(ColorSpaceId::DjiDLog);
+  complexParams.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  complexParams.returnToNodeColorSpace = true;
+  complexParams.lumaStrength = 0.82;
+  complexParams.colorStrength = 1.14;
+  complexParams.shadowStrength = 0.91;
+  complexParams.midtoneStrength = 1.08;
+  complexParams.highlightStrength = 0.76;
+  complexParams.neutralBias = 0.88;
+  complexParams.blackLevel = 1.05;
+  complexParams.whiteRolloff = 0.93;
+  complexParams.colorPurity = 1.07;
+  complexParams.densityOffset = 0.08;
+  complexParams.hueShift = 4.0;
+  const PreparedProcessor complexProcessor = prepareProcessor(lut, complexParams);
+
+  RenderParams technicalParams;
+  technicalParams.nodeColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  technicalParams.lutInputColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  technicalParams.lutOutputColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  technicalParams.returnToNodeColorSpace = false;
+  technicalParams.lumaStrength = 0.779;
+  const PreparedProcessor technicalProcessor = prepareProcessor(lut, technicalParams);
+
+  RenderParams cachedParams = complexParams;
+  cachedParams.nodeColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  cachedParams.lutInputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  cachedParams.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  const PreparedProcessor cachedProcessor = prepareProcessor(lut, cachedParams);
+  const auto buildStarted = std::chrono::steady_clock::now();
+  const std::shared_ptr<const AcceleratedLut> accelerated = buildAcceleratedLut(cachedProcessor, 65);
+  const double buildSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - buildStarted).count();
+
+  auto measure = [&](const char *label, const auto &apply) {
+    Vec3 checksum;
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < pixelCount; ++i) {
+      const Vec3 source{
+        static_cast<double>((i * 17) % 1000) / 999.0,
+        static_cast<double>((i * 37) % 1000) / 999.0,
+        static_cast<double>((i * 67) % 1000) / 999.0,
+      };
+      checksum = checksum + apply(source);
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::cout << label << ": " << (pixelCount / seconds / 1000000.0) << " MP/s, checksum "
+              << checksum.r + checksum.g + checksum.b << "\n";
+  };
+
+  std::cout << "Accelerated LUT build: " << buildSeconds * 1000.0 << " ms\n";
+  measure("Prepared lookup, color managed", [&](const Vec3 &source) { return complexProcessor.apply(source); });
+  measure("Prepared lookup, technical output", [&](const Vec3 &source) { return technicalProcessor.apply(source); });
+  measure("Prepared lookup, same space", [&](const Vec3 &source) { return cachedProcessor.apply(source); });
+  measure("Cached 3D", [&](const Vec3 &source) { return accelerated->applyUnitCube(source); });
 }
 
 }  // namespace
@@ -292,6 +551,14 @@ int main() {
     testIdentityLutPreservesColorAcrossWorkingSpaces();
     testLutWorkingSpaceChangesNonIdentityResult();
     testTechnicalLutInputAndOutputSpaces();
+    testPreparedColorTransformsMatchReference();
+    testAcceleratedLutMatchesPreparedProcessor();
+#ifdef __APPLE__
+    testMetalProcessorMatchesCpu();
+#endif
+    if (std::getenv("LUT_LAYER_MANAGER_BENCHMARK")) {
+      runPerformanceBenchmark();
+    }
     std::cout << "LUTLayerManager tests passed\n";
     return 0;
   } catch (const std::exception &error) {
