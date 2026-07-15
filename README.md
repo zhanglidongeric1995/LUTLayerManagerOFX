@@ -10,7 +10,7 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
 
 最新版安装包：
 
-[下载 LUTLayerManager_1.5.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.5.0.pkg)
+[下载 LUTLayerManager_1.6.0.pkg](https://github.com/zhanglidongeric1995/LUTLayerManagerOFX/raw/refs/heads/main/outputs/LUTLayerManager_1.6.0.pkg)
 
 备用手动安装包（熟悉 OFX 手动安装的用户）：
 
@@ -38,10 +38,11 @@ OpenFX > LIDONG 色彩工具 > LUT 分层管理
   - `色相偏移`
 - 浮点图像会保留负值和高光余量；未选择 LUT 时，画面保持直通。
 - `.cube 路径` 是一个下拉菜单：第一项是 `选择 .cube 文件...`，后面是历史 LUT。
+- 选择 LUT 后会读取 `.cube` 中明确写出的 `Input / Output / Display` 信息，自动更新并显示 LUT 输入与输出空间；Resolve 官方 2383 Film Look LUT 可自动识别为 Cineon 输入、Rec.709 Gamma 2.4 输出。
 - `启用色彩空间转换` 可一键打开或关闭插件内部的前后色彩空间转换；关闭后相关选项会置灰，LUT 和分层调节仍然有效。
 - 可分别设置 `节点输入色彩空间`、`LUT 输入色彩空间` 和 `LUT 输出色彩空间`。
 - `插件输出方式` 可选择返回节点输入空间，或保留技术 LUT 的目标输出空间。
-- 内置 Rec.709 Gamma 2.4、ARRI LogC3/LogC4、Blackmagic Film Gen 5、DaVinci Intermediate、ACEScct、S-Log3、V-Log、Log3G10、Canon C-Log2，以及 DJI D-Log / D-Gamut 转换。
+- 内置 Rec.709 Gamma 2.4、Cineon Film Log / Rec.709、ARRI LogC3/LogC4、Blackmagic Film Gen 5、DaVinci Intermediate、ACEScct、S-Log3、V-Log、Log3G10、Canon C-Log2，以及 DJI D-Log / D-Gamut 转换。
 - macOS / DaVinci Resolve 默认使用 Metal GPU 渲染；实测 59.94 fps 时间线可接近实时播放，CPU 占用从旧版约 500% 降到约 60%–75%。
 - Metal 不可用时自动使用 CPU 回退：多线程分行渲染、高精度传递函数查表，并为同空间分层处理建立 65 点实时缓存；复杂跨色彩空间及超出 0–1 的浮点信号保留高精度处理路径。
 - 常见默认参数会直接应用原始 LUT，不再重复计算无效的分层和色彩转换；拖动参数时也不会反复读取 `.cube` 文件。
@@ -93,7 +94,7 @@ rm "$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/OFXPlugi
 输出：
 
 ```text
-outputs/LUTLayerManager_1.5.0.pkg
+outputs/LUTLayerManager_1.6.0.pkg
 ```
 
 ## 对外发布：Developer ID 签名与 Apple 公证
@@ -141,17 +142,18 @@ outputs/LUTLayerManager_版本号.pkg
 2. 拖到节点或素材上。
 3. 在 `LUT 文件` 里点击 `.cube 路径` 下拉菜单。
 4. 选择 `选择 .cube 文件...` 打开文件选择器，或直接选择历史 LUT。
-5. 需要插件管理 LUT 前后的空间时，开启 `启用色彩空间转换`；只想把 LUT 直接套在当前节点画面上时关闭它。
+5. 保持 `自动匹配 LUT 色彩空间` 开启。选择 LUT 后，`LUT 输入色彩空间`、`LUT 输出色彩空间` 和 `识别结果` 会自动更新，无需再次选择。
 6. `节点输入色彩空间` 选择实际进入插件节点时的空间。RCM 项目通常选择时间线色彩空间；普通 YRGB 项目根据插件位于 CST 之前还是之后，选择相机空间或 CST 输出空间。
-7. `LUT 输入色彩空间` 选择 `.cube` 在应用之前预期接收的空间。
-8. `LUT 输出色彩空间` 选择 `.cube` 应用之后产生的空间。创意 LUT 通常选择 `与 LUT 输入相同`；相机 Log 转 Rec.709 的技术 LUT 选择 `Rec.709 Gamma 2.4`。
-9. `插件输出方式`：创意 LUT 及 RCM 流程选择 `返回节点输入空间`；在普通 YRGB 流程中需要技术 LUT 直接完成 Log 到 Rec.709 转换时，选择 `保留 LUT 输出空间`。
-10. 用 `亮度` 和 `色彩` 分别控制 LUT 的明暗影响和色彩风格。
-11. 用 `暗部 / 中间调 / 高光` 控制 LUT 在不同亮度区域的强度。
+7. 需要插件管理 LUT 前后的空间时，开启 `启用色彩空间转换`；只想把 LUT 直接套在当前节点画面上时关闭它。
+8. `插件输出方式`：创意 LUT 及 RCM 流程选择 `返回节点输入空间`；在普通 YRGB 流程中需要技术 LUT 直接完成 Log 到 Rec.709 转换时，选择 `保留 LUT 输出空间`。
+9. 用 `亮度` 和 `色彩` 分别控制 LUT 的明暗影响和色彩风格。
+10. 用 `暗部 / 中间调 / 高光` 控制 LUT 在不同亮度区域的强度。
 
 ### 色彩空间怎么选
 
 插件无法可靠地从 OpenFX 接口读取 Resolve 为素材设置的相机输入色彩空间，因此不会根据文件名或素材元数据自动猜测。`节点输入色彩空间` 描述的是到达当前节点的像素，不一定是相机拍摄时的原始空间。
+
+`自动匹配 LUT 色彩空间` 会读取 LUT 文件自身明确标注的输入、输出和显示空间。识别成功后，两个 LUT 空间下拉菜单会自动跳到对应值并锁定；如果文件完全没有写色彩空间说明，界面会提示 `文件未写色彩空间，按节点输入处理`。这时可以关闭自动匹配，再使用两个下拉菜单手动覆盖。
 
 开启 `启用色彩空间转换` 后，插件的处理顺序是：
 
@@ -164,6 +166,7 @@ outputs/LUTLayerManager_版本号.pkg
 
 | 使用场景 | 节点输入 | LUT 输入 | LUT 输出 | 插件输出方式 |
 | --- | --- | --- | --- | --- |
+| RCM / DWG 时间线中的 Resolve Rec709 Kodak 2383 Film Look | DaVinci Wide Gamut / Intermediate | 自动：Cineon Film Log / Rec.709 | 自动：Rec.709 Gamma 2.4 | 返回节点输入空间 |
 | RCM / DWG 时间线中的 Rec.709 创意 LUT | DaVinci Wide Gamut / Intermediate | Rec.709 Gamma 2.4 | 与 LUT 输入相同 | 返回节点输入空间 |
 | 普通 YRGB 中的 DJI D-Log 转 Rec.709 技术 LUT | DJI D-Log / D-Gamut | DJI D-Log / D-Gamut | Rec.709 Gamma 2.4 | 保留 LUT 输出空间 |
 | 普通 YRGB 中，插件位于 CST 之后 | CST 的输出空间 | LUT 实际要求的输入 | LUT 实际产生的输出 | 按后续节点要求选择 |
@@ -176,7 +179,7 @@ outputs/LUTLayerManager_版本号.pkg
 ./scripts/test_macos.sh
 ```
 
-测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、11 种传递曲线的往返转换、色彩空间转换开关、技术 LUT 的独立输入/输出空间、DJI 官方 D-Log / D-Gamut 参考值、Metal 与 CPU 同帧结果、快速缓存与精确处理结果的一致性，以及与 OpenColorIO ACES Studio 参考结果的一致性。
+测试会校验 1D、3D、组合 1D + 3D LUT 的插值顺序、浮点范围、12 种传递曲线的往返转换、Cineon 参考值、Resolve Film Look 元数据自动识别、色彩空间转换开关、技术 LUT 的独立输入/输出空间、DJI 官方 D-Log / D-Gamut 参考值、Metal 与 CPU 同帧结果、快速缓存与精确处理结果的一致性，以及与 OpenColorIO ACES Studio 参考结果的一致性。
 
 ## 说明
 

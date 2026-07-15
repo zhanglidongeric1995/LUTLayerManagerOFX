@@ -93,6 +93,24 @@ void testThreeDimensionalLut() {
   requireColor(lut.apply({0.25, 0.50, 0.75}), {0.75, 0.50, 0.25}, "3D LUT should use trilinear interpolation");
 }
 
+void testResolveFilmLookMetadataDetection() {
+  const std::string path = temporaryCubePath("resolve_film_look");
+  writeTextFile(path,
+                "# Resolve Film Look LUT\n"
+                "# Input: Cineon Log\n"
+                "# Output: Kodak 2383 film stock look\n"
+                "# Display: ITU-Rec.709, Gamma 2.4\n"
+                "LUT_3D_SIZE 2\n" +
+                identity3DSamples());
+  const LutData lut = parseCubeFile(path);
+  std::remove(path.c_str());
+
+  require(lut.detectedInputColorSpace == static_cast<int>(ColorSpaceId::CineonRec709),
+          "Resolve Film Look metadata should identify Cineon Log input");
+  require(lut.detectedOutputColorSpace == static_cast<int>(ColorSpaceId::Rec709Gamma24),
+          "Resolve Film Look metadata should identify Rec.709 Gamma 2.4 display output");
+}
+
 void testCombinedOneDimensionalAndThreeDimensionalLut() {
   const std::string path = temporaryCubePath("combined");
   writeTextFile(path,
@@ -126,6 +144,14 @@ void testTransferFunctionRoundTrips() {
               "Transfer function should round-trip in color space " + std::to_string(colorSpace));
     }
   }
+}
+
+void testCineonReferenceValues() {
+  const ColorSpaceSpec &cineon = colorSpaceSpec(static_cast<int>(ColorSpaceId::CineonRec709));
+  require(nearlyEqual(decodeTransfer(95.0 / 1023.0, cineon), 0.0, 1e-10),
+          "Cineon reference black code should decode to linear zero");
+  require(nearlyEqual(encodeTransfer(0.18, cineon), 0.4573196130848124, 1e-12),
+          "Cineon 18 percent gray should match the OpenColorIO reference curve");
 }
 
 void testColorSpaceRoundTrips() {
@@ -340,6 +366,39 @@ void testColorSpaceConversionToggle() {
           "The accelerated cache key should include the color-space conversion toggle");
 }
 
+void testAutomaticLutColorSpaces() {
+  LutData lut = makeBenchmarkLut(33);
+  lut.detectedInputColorSpace = static_cast<int>(ColorSpaceId::CineonRec709);
+  lut.detectedOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+
+  RenderParams automaticParams;
+  automaticParams.autoDetectLutColorSpaces = true;
+  automaticParams.nodeColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  automaticParams.lutInputColorSpace = automaticParams.nodeColorSpace;
+  automaticParams.lutOutputColorSpace = automaticParams.nodeColorSpace;
+  automaticParams.returnToNodeColorSpace = false;
+
+  const EffectiveColorSpaces automaticSpaces = effectiveColorSpaces(lut, automaticParams);
+  require(automaticSpaces.lutInput == static_cast<int>(ColorSpaceId::CineonRec709),
+          "Automatic LUT matching should override the manual input with detected Cineon");
+  require(automaticSpaces.lutOutput == static_cast<int>(ColorSpaceId::Rec709Gamma24),
+          "Automatic LUT matching should override the manual output with detected Rec.709");
+
+  RenderParams manualParams = automaticParams;
+  manualParams.autoDetectLutColorSpaces = false;
+  const Vec3 source{0.32, 0.41, 0.56};
+  const Vec3 automaticResult = prepareProcessor(lut, automaticParams).apply(source);
+  const Vec3 manualResult = prepareProcessor(lut, manualParams).apply(source);
+  const double difference = std::max({std::abs(automaticResult.r - manualResult.r),
+                                      std::abs(automaticResult.g - manualResult.g),
+                                      std::abs(automaticResult.b - manualResult.b)});
+  require(difference > 1e-4,
+          "Detected LUT spaces should materially change processing when they differ from the node space");
+  require(acceleratedCacheKey("auto-test", automaticParams, 65) !=
+            acceleratedCacheKey("auto-test", manualParams, 65),
+          "The accelerated cache key should include automatic LUT matching");
+}
+
 void testPreparedColorTransformsMatchReference() {
   const Vec3 sample{0.27, 0.43, 0.61};
   double maximumFastError = 0.0;
@@ -460,8 +519,8 @@ void testMetalProcessorMatchesCpu() {
   const LutData lut = makeBenchmarkLut(33);
   RenderParams params;
   params.nodeColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
-  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::SonySLog3Cine);
-  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  params.lutInputColorSpace = static_cast<int>(ColorSpaceId::CineonRec709);
+  params.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
   params.returnToNodeColorSpace = false;
   params.lumaStrength = 0.779;
   params.colorStrength = 1.08;
@@ -581,9 +640,11 @@ int main() {
   try {
     testOneDimensionalLut();
     testThreeDimensionalLut();
+    testResolveFilmLookMetadataDetection();
     testCombinedOneDimensionalAndThreeDimensionalLut();
     testFloatRangeIsPreserved();
     testTransferFunctionRoundTrips();
+    testCineonReferenceValues();
     testColorSpaceRoundTrips();
     testOpenColorIOReferenceVectors();
     testDjiOfficialReferenceValues();
@@ -591,6 +652,7 @@ int main() {
     testLutWorkingSpaceChangesNonIdentityResult();
     testTechnicalLutInputAndOutputSpaces();
     testColorSpaceConversionToggle();
+    testAutomaticLutColorSpaces();
     testPreparedColorTransformsMatchReference();
     testAcceleratedLutMatchesPreparedProcessor();
 #ifdef __APPLE__

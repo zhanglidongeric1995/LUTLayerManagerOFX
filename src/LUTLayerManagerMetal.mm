@@ -123,10 +123,23 @@ float decodeTransfer(float value, int transfer, constant float *curve) {
       : (pow(10.0f, (value - pivot) / slope) - 1.0f) / gain;
     return magnitude * 0.9f;
   }
-  if (value <= 0.14f) {
-    return (value - 0.0929f) / 6.025f;
+  if (transfer == 3) {
+    if (value <= 0.14f) {
+      return (value - 0.0929f) / 6.025f;
+    }
+    return (pow(10.0f, 3.89616f * value - 2.27752f) - 0.0108f) / 0.9892f;
   }
-  return (pow(10.0f, 3.89616f * value - 2.27752f) - 0.0108f) / 0.9892f;
+  const float logSideSlope = 0.293255131965f;
+  const float logSideOffset = 0.669599217986f;
+  const float linSideSlope = 0.989202248377f;
+  const float linSideOffset = 0.010797751623f;
+  const float blackCode = 0.09286412511823161f;
+  const float linearSlope = 11.66760435205691f;
+  if (value <= blackCode) {
+    return (value - blackCode) / linearSlope;
+  }
+  return (pow(10.0f, (value - logSideOffset) / logSideSlope) - linSideOffset) /
+         linSideSlope;
 }
 
 float encodeTransfer(float value, int transfer, constant float *curve) {
@@ -151,11 +164,24 @@ float encodeTransfer(float value, int transfer, constant float *curve) {
     const float encoded = slope * log10(1.0f + abs(normalized) * gain);
     return normalized < 0.0f ? pivot - encoded : pivot + encoded;
   }
-  if (value <= 0.0078f) {
-    return 6.025f * value + 0.0929f;
+  if (transfer == 3) {
+    if (value <= 0.0078f) {
+      return 6.025f * value + 0.0929f;
+    }
+    const float argument = max(value * 0.9892f + 0.0108f, 1.17549435e-38f);
+    return log10(argument) * 0.256663f + 0.584555f;
   }
-  const float argument = max(value * 0.9892f + 0.0108f, 1.17549435e-38f);
-  return log10(argument) * 0.256663f + 0.584555f;
+  const float logSideSlope = 0.293255131965f;
+  const float logSideOffset = 0.669599217986f;
+  const float linSideSlope = 0.989202248377f;
+  const float linSideOffset = 0.010797751623f;
+  const float blackCode = 0.09286412511823161f;
+  const float linearSlope = 11.66760435205691f;
+  if (value <= 0.0f) {
+    return linearSlope * value + blackCode;
+  }
+  const float argument = max(linSideSlope * value + linSideOffset, 1.17549435e-38f);
+  return logSideSlope * log10(argument) + logSideOffset;
 }
 
 float3 decodeTransfer(float3 value, int transfer, constant float *curve) {

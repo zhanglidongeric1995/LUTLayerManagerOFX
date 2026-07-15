@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -36,11 +37,13 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 5;
+constexpr unsigned int kVersionMinor = 6;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
 constexpr const char *kParamColorSpaceConversionEnabled = "colorSpaceConversionEnabled";
+constexpr const char *kParamAutoDetectLutColorSpaces = "autoDetectLutColorSpaces";
+constexpr const char *kParamDetectedLutColorSpaces = "detectedLutColorSpaces";
 // Keep this ID for compatibility with projects created before the parameter
 // was renamed from "working color space" to "node input color space".
 constexpr const char *kParamWorkingSpace = "workingSpace";
@@ -95,9 +98,10 @@ enum class ColorSpaceId : int {
   RedLog3G10 = 8,
   CanonLog2 = 9,
   DjiDLog = 10,
+  CineonRec709 = 11,
 };
 
-constexpr int kColorSpaceCount = 11;
+constexpr int kColorSpaceCount = 12;
 
 const std::vector<std::string> &colorSpaceLabels() {
   static const std::vector<std::string> labels = {
@@ -112,6 +116,7 @@ const std::vector<std::string> &colorSpaceLabels() {
     "RED Log3G10 / REDWideGamutRGB",
     "Canon C-Log2 / Cinema Gamut",
     "DJI D-Log / D-Gamut",
+    "Cineon Film Log / Rec.709",
   };
   return labels;
 }
@@ -176,7 +181,13 @@ Mat3 multiply(const Mat3 &a, const Mat3 &b) {
   return result;
 }
 
-enum class TransferKind { Gamma24, CameraLog, CanonLog2, DjiDLog };
+enum class TransferKind : int {
+  Gamma24 = 0,
+  CameraLog = 1,
+  CanonLog2 = 2,
+  DjiDLog = 3,
+  Cineon = 4,
+};
 
 struct CameraLogCurve {
   double base = 2.0;
@@ -300,6 +311,8 @@ const std::array<ColorSpaceSpec, kColorSpaceCount> &colorSpaceSpecs() {
                          {{{0.691430323905921, 0.212906283248268, 0.0956633928458124,
                             0.0665972813314137, 1.00954658165132, -0.0761438629827340,
                             -0.0172435345385446, -0.0729864327663068, 1.09022996730485}}}),
+      // Traditional Cineon curve paired with Rec.709 primaries for Resolve Film Look LUTs.
+      makeColorSpaceSpec(TransferKind::Cineon, {}, inverse(ap0ToRec709)),
     }};
   }();
   return specs;
@@ -360,6 +373,35 @@ double linearToDjiDLog(double value) {
   return std::log10(argument) * 0.256663 + 0.584555;
 }
 
+double cineonToLinear(double value) {
+  constexpr double logSideSlope = 0.293255131965;
+  constexpr double logSideOffset = 0.669599217986;
+  constexpr double linSideSlope = 0.989202248377;
+  constexpr double linSideOffset = 0.010797751623;
+  constexpr double blackCode = 0.09286412511823161;
+  constexpr double linearSlope = 11.66760435205691;
+  if (value <= blackCode) {
+    return (value - blackCode) / linearSlope;
+  }
+  return (std::pow(10.0, (value - logSideOffset) / logSideSlope) - linSideOffset) /
+         linSideSlope;
+}
+
+double linearToCineon(double value) {
+  constexpr double logSideSlope = 0.293255131965;
+  constexpr double logSideOffset = 0.669599217986;
+  constexpr double linSideSlope = 0.989202248377;
+  constexpr double linSideOffset = 0.010797751623;
+  constexpr double blackCode = 0.09286412511823161;
+  constexpr double linearSlope = 11.66760435205691;
+  if (value <= 0.0) {
+    return linearSlope * value + blackCode;
+  }
+  const double argument = std::max(linSideSlope * value + linSideOffset,
+                                   std::numeric_limits<double>::min());
+  return logSideSlope * std::log10(argument) + logSideOffset;
+}
+
 double decodeTransfer(double value, const ColorSpaceSpec &spec) {
   if (!std::isfinite(value)) {
     return 0.0;
@@ -373,6 +415,8 @@ double decodeTransfer(double value, const ColorSpaceSpec &spec) {
       return canonLog2ToLinear(value);
     case TransferKind::DjiDLog:
       return djiDLogToLinear(value);
+    case TransferKind::Cineon:
+      return cineonToLinear(value);
   }
   return value;
 }
@@ -390,6 +434,8 @@ double encodeTransfer(double value, const ColorSpaceSpec &spec) {
       return linearToCanonLog2(value);
     case TransferKind::DjiDLog:
       return linearToDjiDLog(value);
+    case TransferKind::Cineon:
+      return linearToCineon(value);
   }
   return value;
 }
@@ -448,6 +494,9 @@ const std::array<TransferLookup, kColorSpaceCount> &transferLookups() {
           break;
         case TransferKind::DjiDLog:
           lookup.encodeMinimum = 0.0078;
+          break;
+        case TransferKind::Cineon:
+          lookup.encodeMinimum = 0.0;
           break;
         case TransferKind::CanonLog2:
           // Canon Log 2 is symmetric around zero and remains on the exact path.
@@ -583,6 +632,13 @@ std::string trim(const std::string &s) {
   }
   const size_t last = s.find_last_not_of(ws);
   return s.substr(first, last - first + 1);
+}
+
+std::string lowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value;
 }
 
 std::string unquote(std::string s) {
@@ -869,6 +925,10 @@ struct LutData {
   Vec3 domainMax{1.0, 1.0, 1.0};
   std::vector<Vec3> values;
   std::vector<Vec3> shaperValues;
+  std::string title;
+  std::vector<std::string> metadataComments;
+  int detectedInputColorSpace = -1;
+  int detectedOutputColorSpace = -1;
   std::string error;
 
   bool valid() const {
@@ -973,6 +1033,79 @@ private:
   }
 };
 
+int detectColorSpaceFromMetadata(const std::string &rawText) {
+  const std::string text = lowerAscii(rawText);
+  if (text.find("cineon") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::CineonRec709);
+  }
+  if (text.find("d-log") != std::string::npos || text.find("dlog") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::DjiDLog);
+  }
+  if (text.find("logc4") != std::string::npos || text.find("log c4") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::ArriLogC4);
+  }
+  if (text.find("logc3") != std::string::npos || text.find("log c3") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::ArriLogC3);
+  }
+  if (text.find("blackmagic film") != std::string::npos ||
+      text.find("bmd film") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::BmdFilmGen5);
+  }
+  if (text.find("davinci intermediate") != std::string::npos ||
+      text.find("davinci wide gamut") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  }
+  if (text.find("acescct") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::ACEScct);
+  }
+  if (text.find("s-log3") != std::string::npos || text.find("slog3") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::SonySLog3Cine);
+  }
+  if (text.find("v-log") != std::string::npos || text.find("vlog") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::PanasonicVLog);
+  }
+  if (text.find("log3g10") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::RedLog3G10);
+  }
+  if (text.find("c-log2") != std::string::npos || text.find("clog2") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::CanonLog2);
+  }
+  if (text.find("rec.709") != std::string::npos ||
+      text.find("rec709") != std::string::npos ||
+      text.find("rec 709") != std::string::npos) {
+    return static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  }
+  return -1;
+}
+
+std::string canonicalMetadataKey(std::string key) {
+  key = lowerAscii(trim(key));
+  key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char character) {
+    return std::isspace(character) || character == '_' || character == '-';
+  }), key.end());
+  return key;
+}
+
+void detectLutColorSpaces(LutData &lut) {
+  for (const std::string &comment : lut.metadataComments) {
+    const size_t separator = comment.find(':');
+    if (separator == std::string::npos) {
+      continue;
+    }
+    const std::string key = canonicalMetadataKey(comment.substr(0, separator));
+    const int detected = detectColorSpaceFromMetadata(comment.substr(separator + 1));
+    if (detected < 0) {
+      continue;
+    }
+    if (key == "input" || key == "inputcolorspace" || key == "sourcecolorspace") {
+      lut.detectedInputColorSpace = detected;
+    } else if (key == "output" || key == "outputcolorspace" ||
+               key == "display" || key == "displaycolorspace") {
+      lut.detectedOutputColorSpace = detected;
+    }
+  }
+}
+
 LutData parseCubeFile(const std::string &path) {
   LutData lut;
   std::ifstream in(path);
@@ -989,6 +1122,10 @@ LutData parseCubeFile(const std::string &path) {
   while (std::getline(in, line)) {
     const size_t comment = line.find('#');
     if (comment != std::string::npos) {
+      const std::string metadata = trim(line.substr(comment + 1));
+      if (!metadata.empty()) {
+        lut.metadataComments.push_back(metadata);
+      }
       line = line.substr(0, comment);
     }
     line = trim(line);
@@ -1001,6 +1138,9 @@ LutData parseCubeFile(const std::string &path) {
     ss >> tag;
 
     if (tag == "TITLE") {
+      std::string title;
+      std::getline(ss, title);
+      lut.title = unquote(title);
       continue;
     }
     if (tag == "LUT_1D_SIZE") {
@@ -1032,6 +1172,8 @@ LutData parseCubeFile(const std::string &path) {
       samples.push_back({first, second, third});
     }
   }
+
+  detectLutColorSpaces(lut);
 
   const size_t required3D = cubeSampleCount(declared3D);
   if (declared3D > 1 && required3D == 0) {
@@ -1136,6 +1278,7 @@ LutCacheResult getLut(const std::string &rawPath) {
 struct RenderParams {
   std::string cubePath;
   bool colorSpaceConversionEnabled = true;
+  bool autoDetectLutColorSpaces = true;
   int nodeColorSpace = 0;
   int lutInputColorSpace = -1;
   int lutOutputColorSpace = -1;
@@ -1152,6 +1295,36 @@ struct RenderParams {
   double densityOffset = 0.0;
   double hueShift = 0.0;
 };
+
+struct EffectiveColorSpaces {
+  int node = 0;
+  int lutInput = 0;
+  int lutOutput = 0;
+};
+
+EffectiveColorSpaces effectiveColorSpaces(const LutData &lut, const RenderParams &params) {
+  EffectiveColorSpaces spaces;
+  spaces.node = sanitizeColorSpace(params.nodeColorSpace);
+  spaces.lutInput = params.lutInputColorSpace < 0
+                      ? spaces.node
+                      : sanitizeColorSpace(params.lutInputColorSpace);
+  if (params.autoDetectLutColorSpaces && lut.detectedInputColorSpace >= 0) {
+    spaces.lutInput = sanitizeColorSpace(lut.detectedInputColorSpace);
+  }
+
+  spaces.lutOutput = params.lutOutputColorSpace < 0
+                       ? spaces.lutInput
+                       : sanitizeColorSpace(params.lutOutputColorSpace);
+  if (params.autoDetectLutColorSpaces && lut.detectedOutputColorSpace >= 0) {
+    spaces.lutOutput = sanitizeColorSpace(lut.detectedOutputColorSpace);
+  }
+
+  if (!params.colorSpaceConversionEnabled) {
+    spaces.lutInput = spaces.node;
+    spaces.lutOutput = spaces.node;
+  }
+  return spaces;
+}
 
 Vec3 lumaWeights(int colorSpace) { return colorSpaceSpec(colorSpace).lumaWeights; }
 
@@ -1300,21 +1473,13 @@ struct PreparedProcessor {
 };
 
 PreparedProcessor prepareProcessor(const LutData &lut, const RenderParams &params) {
-  const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
-  const int selectedLutInputSpace = params.lutInputColorSpace < 0
-                                      ? nodeSpace
-                                      : sanitizeColorSpace(params.lutInputColorSpace);
-  const int selectedLutOutputSpace = params.lutOutputColorSpace < 0
-                                       ? selectedLutInputSpace
-                                       : sanitizeColorSpace(params.lutOutputColorSpace);
-  const int lutInputSpace = params.colorSpaceConversionEnabled ? selectedLutInputSpace : nodeSpace;
-  const int lutOutputSpace = params.colorSpaceConversionEnabled ? selectedLutOutputSpace : nodeSpace;
+  const EffectiveColorSpaces spaces = effectiveColorSpaces(lut, params);
 
   PreparedProcessor processor;
   processor.lut = &lut;
-  processor.nodeToLutInput = prepareColorTransform(nodeSpace, lutInputSpace);
-  processor.layer = prepareLayerContext(params, lutInputSpace, lutOutputSpace);
-  processor.lutOutputToNode = prepareColorTransform(lutOutputSpace, nodeSpace);
+  processor.nodeToLutInput = prepareColorTransform(spaces.node, spaces.lutInput);
+  processor.layer = prepareLayerContext(params, spaces.lutInput, spaces.lutOutput);
+  processor.lutOutputToNode = prepareColorTransform(spaces.lutOutput, spaces.node);
   processor.returnToNodeColorSpace = params.colorSpaceConversionEnabled
                                        ? params.returnToNodeColorSpace
                                        : true;
@@ -1471,6 +1636,7 @@ std::string acceleratedCacheKey(const std::string &sourceRevision,
   std::ostringstream key;
   key << sourceRevision << '|' << resolution << '|'
       << params.colorSpaceConversionEnabled << '|'
+      << params.autoDetectLutColorSpaces << '|'
       << params.nodeColorSpace << '|' << params.lutInputColorSpace << '|'
       << params.lutOutputColorSpace << '|' << params.returnToNodeColorSpace << '|'
       << std::hexfloat
@@ -1616,18 +1782,10 @@ bool executeMetalRender(void *commandQueue,
     return false;
   }
 
-  const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
-  const int selectedInputSpace = params.lutInputColorSpace < 0
-                                   ? nodeSpace
-                                   : sanitizeColorSpace(params.lutInputColorSpace);
-  const int selectedOutputSpace = params.lutOutputColorSpace < 0
-                                    ? selectedInputSpace
-                                    : sanitizeColorSpace(params.lutOutputColorSpace);
-  const int inputSpace = params.colorSpaceConversionEnabled ? selectedInputSpace : nodeSpace;
-  const int outputSpace = params.colorSpaceConversionEnabled ? selectedOutputSpace : nodeSpace;
-  const ColorSpaceSpec &nodeSpec = colorSpaceSpec(nodeSpace);
-  const ColorSpaceSpec &inputSpec = colorSpaceSpec(inputSpace);
-  const ColorSpaceSpec &outputSpec = colorSpaceSpec(outputSpace);
+  const EffectiveColorSpaces spaces = effectiveColorSpaces(lut, params);
+  const ColorSpaceSpec &nodeSpec = colorSpaceSpec(spaces.node);
+  const ColorSpaceSpec &inputSpec = colorSpaceSpec(spaces.lutInput);
+  const ColorSpaceSpec &outputSpec = colorSpaceSpec(spaces.lutOutput);
 
   MetalRenderRequest request;
   request.commandQueue = commandQueue;
@@ -2058,6 +2216,23 @@ void defineHiddenString(OfxParamSetHandle paramSet, const char *name, const std:
   gProp->propSetInt(props, kOfxParamPropPersistant, 0, 1);
 }
 
+void defineStatusString(OfxParamSetHandle paramSet,
+                        const char *name,
+                        const char *label,
+                        const char *parent,
+                        const char *defaultValue) {
+  OfxPropertySetHandle props = nullptr;
+  if (gParam->paramDefine(paramSet, kOfxParamTypeString, name, &props) != kOfxStatOK) {
+    return;
+  }
+  setLabels(props, label);
+  setParent(props, parent);
+  gProp->propSetString(props, kOfxParamPropStringMode, 0, kOfxParamStringIsLabel);
+  gProp->propSetString(props, kOfxParamPropDefault, 0, defaultValue);
+  gProp->propSetInt(props, kOfxParamPropPluginMayWrite, 0, 1);
+  gProp->propSetInt(props, kOfxParamPropPersistant, 0, 0);
+}
+
 OfxStatus describe(OfxImageEffectHandle effect) {
   OfxPropertySetHandle props = nullptr;
   if (gEffect->getPropertySet(effect, &props) != kOfxStatOK) {
@@ -2117,6 +2292,16 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
                 "启用色彩空间转换",
                 "colorSpaceGroup",
                 true);
+  defineBoolean(paramSet,
+                kParamAutoDetectLutColorSpaces,
+                "自动匹配 LUT 色彩空间",
+                "colorSpaceGroup",
+                true);
+  defineStatusString(paramSet,
+                     kParamDetectedLutColorSpaces,
+                     "识别结果",
+                     "colorSpaceGroup",
+                     "等待选择 LUT");
   defineChoiceStrings(paramSet,
                       kParamWorkingSpace,
                       "节点输入色彩空间",
@@ -2151,14 +2336,17 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
     if (gParam->paramGetHandle(paramSet, kParamColorSpaceConversionEnabled, &param, &props) == kOfxStatOK) {
       setHint(props, "开启：按节点输入、LUT 输入和 LUT 输出设置进行转换；关闭：跳过所有前后色彩空间转换，直接在当前节点画面上应用 LUT，分层调节仍然有效。");
     }
+    if (gParam->paramGetHandle(paramSet, kParamAutoDetectLutColorSpaces, &param, &props) == kOfxStatOK) {
+      setHint(props, "选择 LUT 后读取 .cube 文件中明确写出的 Input、Output 和 Display 信息，并自动更新 LUT 输入与输出空间；识别不到时按与节点输入相同处理。");
+    }
     if (gParam->paramGetHandle(paramSet, kParamWorkingSpace, &param, &props) == kOfxStatOK) {
       setHint(props, "选择实际进入当前 OFX 节点的色彩空间；它不一定等于相机素材的原始色彩空间。RCM 项目通常选择时间线色彩空间。");
     }
     if (gParam->paramGetHandle(paramSet, kParamLutWorkingSpace, &param, &props) == kOfxStatOK) {
-      setHint(props, "选择 .cube 在应用之前预期接收的色彩空间；只有与节点实际输入不同时才会先做转换。");
+      setHint(props, "自动匹配开启时由 LUT 文件说明自动设置；关闭自动匹配后可手动选择 .cube 在应用之前预期接收的空间。");
     }
     if (gParam->paramGetHandle(paramSet, kParamLutOutputSpace, &param, &props) == kOfxStatOK) {
-      setHint(props, "选择 .cube 应用之后产生的色彩空间。创意 LUT 通常与输入相同；D-Log 转 Rec.709 等技术 LUT 应选择 Rec.709。");
+      setHint(props, "自动匹配开启时由 LUT 文件说明自动设置；关闭自动匹配后可手动选择 .cube 应用之后产生的空间。");
     }
     if (gParam->paramGetHandle(paramSet, kParamOutputMode, &param, &props) == kOfxStatOK) {
       setHint(props, "创意 LUT 或 RCM 流程选择返回节点输入空间；需要让技术 LUT 直接输出 Rec.709 等目标空间时选择保留 LUT 输出空间。");
@@ -2271,6 +2459,74 @@ void setCurrentChoiceParam(OfxParamSetHandle paramSet, const char *name, int val
   }
 }
 
+std::string currentCubePath(OfxParamSetHandle paramSet) {
+  std::string path = getCurrentStringParam(paramSet, kParamCubePath);
+  if (!path.empty()) {
+    return path;
+  }
+  const std::vector<std::string> history = readLutHistory();
+  return pathForChoiceIndex(getCurrentChoiceParam(paramSet, kParamCubeChoice, 0), history);
+}
+
+std::string colorSpaceLabel(int colorSpace) {
+  if (colorSpace < 0 || colorSpace >= kColorSpaceCount) {
+    return {};
+  }
+  return colorSpaceLabels()[static_cast<size_t>(colorSpace)];
+}
+
+void syncDetectedLutColorSpaces(OfxParamSetHandle paramSet) {
+  const bool automatic = getCurrentChoiceParam(paramSet, kParamAutoDetectLutColorSpaces, 1) != 0;
+  if (!automatic) {
+    setCurrentStringParam(paramSet, kParamDetectedLutColorSpaces, "手动设置");
+    return;
+  }
+
+  const std::string path = currentCubePath(paramSet);
+  if (path.empty()) {
+    setCurrentChoiceParam(paramSet, kParamLutWorkingSpace, 0);
+    setCurrentChoiceParam(paramSet, kParamLutOutputSpace, 0);
+    setCurrentStringParam(paramSet, kParamDetectedLutColorSpaces, "未选择 LUT");
+    return;
+  }
+
+  const LutCacheResult cached = getLut(path);
+  const LutData &lut = *cached.lut;
+  if (!lut.valid()) {
+    setCurrentChoiceParam(paramSet, kParamLutWorkingSpace, 0);
+    setCurrentChoiceParam(paramSet, kParamLutOutputSpace, 0);
+    setCurrentStringParam(paramSet, kParamDetectedLutColorSpaces, "无法读取 LUT，按节点输入处理");
+    return;
+  }
+
+  const bool hasInput = lut.detectedInputColorSpace >= 0;
+  const bool hasOutput = lut.detectedOutputColorSpace >= 0;
+  setCurrentChoiceParam(paramSet,
+                        kParamLutWorkingSpace,
+                        hasInput ? lut.detectedInputColorSpace + 1 : 0);
+  setCurrentChoiceParam(paramSet,
+                        kParamLutOutputSpace,
+                        hasOutput ? lut.detectedOutputColorSpace + 1 : 0);
+
+  if (!hasInput && !hasOutput) {
+    setCurrentStringParam(paramSet,
+                          kParamDetectedLutColorSpaces,
+                          "文件未写色彩空间，按节点输入处理");
+    return;
+  }
+
+  const std::string inputLabel = hasInput
+                                   ? colorSpaceLabel(lut.detectedInputColorSpace)
+                                   : "与节点输入相同";
+  const std::string outputLabel = hasOutput
+                                    ? colorSpaceLabel(lut.detectedOutputColorSpace)
+                                    : "与 LUT 输入相同";
+  const std::string prefix = hasInput && hasOutput ? "已识别：" : "部分识别：";
+  setCurrentStringParam(paramSet,
+                        kParamDetectedLutColorSpaces,
+                        prefix + inputLabel + " -> " + outputLabel);
+}
+
 void setParamEnabled(OfxParamSetHandle paramSet, const char *name, bool enabled) {
   OfxParamHandle param = nullptr;
   OfxPropertySetHandle props = nullptr;
@@ -2281,9 +2537,11 @@ void setParamEnabled(OfxParamSetHandle paramSet, const char *name, bool enabled)
 
 void updateColorSpaceControlEnabledness(OfxParamSetHandle paramSet) {
   const bool enabled = getCurrentChoiceParam(paramSet, kParamColorSpaceConversionEnabled, 1) != 0;
+  const bool automatic = getCurrentChoiceParam(paramSet, kParamAutoDetectLutColorSpaces, 1) != 0;
+  setParamEnabled(paramSet, kParamAutoDetectLutColorSpaces, enabled);
   setParamEnabled(paramSet, kParamWorkingSpace, enabled);
-  setParamEnabled(paramSet, kParamLutWorkingSpace, enabled);
-  setParamEnabled(paramSet, kParamLutOutputSpace, enabled);
+  setParamEnabled(paramSet, kParamLutWorkingSpace, enabled && !automatic);
+  setParamEnabled(paramSet, kParamLutOutputSpace, enabled && !automatic);
   setParamEnabled(paramSet, kParamOutputMode, enabled);
 }
 
@@ -2320,6 +2578,8 @@ RenderParams readRenderParams(OfxImageEffectHandle effect, OfxTime time) {
   }
   params.colorSpaceConversionEnabled =
     getChoiceParam(paramSet, kParamColorSpaceConversionEnabled, time, 1) != 0;
+  params.autoDetectLutColorSpaces =
+    getChoiceParam(paramSet, kParamAutoDetectLutColorSpaces, time, 1) != 0;
   params.nodeColorSpace = sanitizeColorSpace(getChoiceParam(paramSet, kParamWorkingSpace, time, 0));
   const int lutInputChoice = getChoiceParam(paramSet, kParamLutWorkingSpace, time, 0);
   params.lutInputColorSpace = lutInputChoice <= 0
@@ -2528,6 +2788,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
         setCurrentChoiceParam(paramSet, kParamCubeChoice, index);
       }
     }
+    syncDetectedLutColorSpaces(paramSet);
     updateColorSpaceControlEnabledness(paramSet);
   }
   return kOfxStatOK;
@@ -2544,9 +2805,14 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
   }
   const std::string changed = changedName ? changedName : "";
 
-  if (changed == kParamColorSpaceConversionEnabled) {
+  if (changed == kParamColorSpaceConversionEnabled ||
+      changed == kParamAutoDetectLutColorSpaces) {
     OfxParamSetHandle paramSet = nullptr;
     if (gEffect->getParamSet(effect, &paramSet) == kOfxStatOK && paramSet) {
+      ScopedParamSync sync;
+      if (changed == kParamAutoDetectLutColorSpaces) {
+        syncDetectedLutColorSpaces(paramSet);
+      }
       updateColorSpaceControlEnabledness(paramSet);
     }
   }
@@ -2603,6 +2869,12 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
 #ifdef __APPLE__
     resetMetalRenderCaches();
 #endif
+    OfxParamSetHandle paramSet = nullptr;
+    if (gEffect->getParamSet(effect, &paramSet) == kOfxStatOK && paramSet) {
+      ScopedParamSync sync;
+      syncDetectedLutColorSpaces(paramSet);
+      updateColorSpaceControlEnabledness(paramSet);
+    }
   }
   return kOfxStatOK;
 }
