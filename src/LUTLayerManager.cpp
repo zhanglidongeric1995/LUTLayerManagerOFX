@@ -36,10 +36,11 @@ namespace {
 
 constexpr const char *kPluginIdentifier = "com.lidong.ofx.LUTLayerManager";
 constexpr unsigned int kVersionMajor = 1;
-constexpr unsigned int kVersionMinor = 4;
+constexpr unsigned int kVersionMinor = 5;
 
 constexpr const char *kParamCubeChoice = "cubeChoice";
 constexpr const char *kParamCubePath = "cubePath";
+constexpr const char *kParamColorSpaceConversionEnabled = "colorSpaceConversionEnabled";
 // Keep this ID for compatibility with projects created before the parameter
 // was renamed from "working color space" to "node input color space".
 constexpr const char *kParamWorkingSpace = "workingSpace";
@@ -1134,6 +1135,7 @@ LutCacheResult getLut(const std::string &rawPath) {
 
 struct RenderParams {
   std::string cubePath;
+  bool colorSpaceConversionEnabled = true;
   int nodeColorSpace = 0;
   int lutInputColorSpace = -1;
   int lutOutputColorSpace = -1;
@@ -1299,19 +1301,23 @@ struct PreparedProcessor {
 
 PreparedProcessor prepareProcessor(const LutData &lut, const RenderParams &params) {
   const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
-  const int lutInputSpace = params.lutInputColorSpace < 0
-                              ? nodeSpace
-                              : sanitizeColorSpace(params.lutInputColorSpace);
-  const int lutOutputSpace = params.lutOutputColorSpace < 0
-                               ? lutInputSpace
-                               : sanitizeColorSpace(params.lutOutputColorSpace);
+  const int selectedLutInputSpace = params.lutInputColorSpace < 0
+                                      ? nodeSpace
+                                      : sanitizeColorSpace(params.lutInputColorSpace);
+  const int selectedLutOutputSpace = params.lutOutputColorSpace < 0
+                                       ? selectedLutInputSpace
+                                       : sanitizeColorSpace(params.lutOutputColorSpace);
+  const int lutInputSpace = params.colorSpaceConversionEnabled ? selectedLutInputSpace : nodeSpace;
+  const int lutOutputSpace = params.colorSpaceConversionEnabled ? selectedLutOutputSpace : nodeSpace;
 
   PreparedProcessor processor;
   processor.lut = &lut;
   processor.nodeToLutInput = prepareColorTransform(nodeSpace, lutInputSpace);
   processor.layer = prepareLayerContext(params, lutInputSpace, lutOutputSpace);
   processor.lutOutputToNode = prepareColorTransform(lutOutputSpace, nodeSpace);
-  processor.returnToNodeColorSpace = params.returnToNodeColorSpace;
+  processor.returnToNodeColorSpace = params.colorSpaceConversionEnabled
+                                       ? params.returnToNodeColorSpace
+                                       : true;
   processor.directLutOnly =
     processor.nodeToLutInput.identity &&
     processor.layer.primaryMixIsDefault &&
@@ -1464,6 +1470,7 @@ std::string acceleratedCacheKey(const std::string &sourceRevision,
                                 int resolution) {
   std::ostringstream key;
   key << sourceRevision << '|' << resolution << '|'
+      << params.colorSpaceConversionEnabled << '|'
       << params.nodeColorSpace << '|' << params.lutInputColorSpace << '|'
       << params.lutOutputColorSpace << '|' << params.returnToNodeColorSpace << '|'
       << std::hexfloat
@@ -1610,12 +1617,14 @@ bool executeMetalRender(void *commandQueue,
   }
 
   const int nodeSpace = sanitizeColorSpace(params.nodeColorSpace);
-  const int inputSpace = params.lutInputColorSpace < 0
-                           ? nodeSpace
-                           : sanitizeColorSpace(params.lutInputColorSpace);
-  const int outputSpace = params.lutOutputColorSpace < 0
-                            ? inputSpace
-                            : sanitizeColorSpace(params.lutOutputColorSpace);
+  const int selectedInputSpace = params.lutInputColorSpace < 0
+                                   ? nodeSpace
+                                   : sanitizeColorSpace(params.lutInputColorSpace);
+  const int selectedOutputSpace = params.lutOutputColorSpace < 0
+                                    ? selectedInputSpace
+                                    : sanitizeColorSpace(params.lutOutputColorSpace);
+  const int inputSpace = params.colorSpaceConversionEnabled ? selectedInputSpace : nodeSpace;
+  const int outputSpace = params.colorSpaceConversionEnabled ? selectedOutputSpace : nodeSpace;
   const ColorSpaceSpec &nodeSpec = colorSpaceSpec(nodeSpace);
   const ColorSpaceSpec &inputSpec = colorSpaceSpec(inputSpace);
   const ColorSpaceSpec &outputSpec = colorSpaceSpec(outputSpace);
@@ -2002,6 +2011,21 @@ void defineDouble(OfxParamSetHandle paramSet,
   gProp->propSetDouble(props, kOfxParamPropDisplayMax, 0, displayMax);
 }
 
+void defineBoolean(OfxParamSetHandle paramSet,
+                   const char *name,
+                   const char *label,
+                   const char *parent,
+                   bool defaultValue) {
+  OfxPropertySetHandle props = nullptr;
+  if (gParam->paramDefine(paramSet, kOfxParamTypeBoolean, name, &props) != kOfxStatOK) {
+    return;
+  }
+  setLabels(props, label);
+  setParent(props, parent);
+  gProp->propSetInt(props, kOfxParamPropDefault, 0, defaultValue ? 1 : 0);
+  gProp->propSetInt(props, kOfxParamPropEvaluateOnChange, 0, 1);
+}
+
 void defineChoiceStrings(OfxParamSetHandle paramSet,
                          const char *name,
                          const char *label,
@@ -2088,6 +2112,11 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
   defineHiddenString(paramSet, kParamCubePath, saved);
 
   defineGroup(paramSet, "colorSpaceGroup", "色彩空间转换", true);
+  defineBoolean(paramSet,
+                kParamColorSpaceConversionEnabled,
+                "启用色彩空间转换",
+                "colorSpaceGroup",
+                true);
   defineChoiceStrings(paramSet,
                       kParamWorkingSpace,
                       "节点输入色彩空间",
@@ -2119,6 +2148,9 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) {
   {
     OfxParamHandle param = nullptr;
     OfxPropertySetHandle props = nullptr;
+    if (gParam->paramGetHandle(paramSet, kParamColorSpaceConversionEnabled, &param, &props) == kOfxStatOK) {
+      setHint(props, "开启：按节点输入、LUT 输入和 LUT 输出设置进行转换；关闭：跳过所有前后色彩空间转换，直接在当前节点画面上应用 LUT，分层调节仍然有效。");
+    }
     if (gParam->paramGetHandle(paramSet, kParamWorkingSpace, &param, &props) == kOfxStatOK) {
       setHint(props, "选择实际进入当前 OFX 节点的色彩空间；它不一定等于相机素材的原始色彩空间。RCM 项目通常选择时间线色彩空间。");
     }
@@ -2239,6 +2271,22 @@ void setCurrentChoiceParam(OfxParamSetHandle paramSet, const char *name, int val
   }
 }
 
+void setParamEnabled(OfxParamSetHandle paramSet, const char *name, bool enabled) {
+  OfxParamHandle param = nullptr;
+  OfxPropertySetHandle props = nullptr;
+  if (gParam->paramGetHandle(paramSet, name, &param, &props) == kOfxStatOK && props) {
+    gProp->propSetInt(props, kOfxParamPropEnabled, 0, enabled ? 1 : 0);
+  }
+}
+
+void updateColorSpaceControlEnabledness(OfxParamSetHandle paramSet) {
+  const bool enabled = getCurrentChoiceParam(paramSet, kParamColorSpaceConversionEnabled, 1) != 0;
+  setParamEnabled(paramSet, kParamWorkingSpace, enabled);
+  setParamEnabled(paramSet, kParamLutWorkingSpace, enabled);
+  setParamEnabled(paramSet, kParamLutOutputSpace, enabled);
+  setParamEnabled(paramSet, kParamOutputMode, enabled);
+}
+
 struct ScopedParamSync {
   ScopedParamSync() : previous(gParamSyncInProgress) { gParamSyncInProgress = true; }
   ~ScopedParamSync() { gParamSyncInProgress = previous; }
@@ -2270,6 +2318,8 @@ RenderParams readRenderParams(OfxImageEffectHandle effect, OfxTime time) {
     const std::vector<std::string> history = readLutHistory();
     params.cubePath = pathForChoiceIndex(getChoiceParam(paramSet, kParamCubeChoice, time, 0), history);
   }
+  params.colorSpaceConversionEnabled =
+    getChoiceParam(paramSet, kParamColorSpaceConversionEnabled, time, 1) != 0;
   params.nodeColorSpace = sanitizeColorSpace(getChoiceParam(paramSet, kParamWorkingSpace, time, 0));
   const int lutInputChoice = getChoiceParam(paramSet, kParamLutWorkingSpace, time, 0);
   params.lutInputColorSpace = lutInputChoice <= 0
@@ -2478,6 +2528,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
         setCurrentChoiceParam(paramSet, kParamCubeChoice, index);
       }
     }
+    updateColorSpaceControlEnabledness(paramSet);
   }
   return kOfxStatOK;
 }
@@ -2492,6 +2543,13 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     gProp->propGetString(inArgs, kOfxPropName, 0, &changedName);
   }
   const std::string changed = changedName ? changedName : "";
+
+  if (changed == kParamColorSpaceConversionEnabled) {
+    OfxParamSetHandle paramSet = nullptr;
+    if (gEffect->getParamSet(effect, &paramSet) == kOfxStatOK && paramSet) {
+      updateColorSpaceControlEnabledness(paramSet);
+    }
+  }
 
   if (changed == kParamCubeChoice) {
     OfxParamSetHandle paramSet = nullptr;

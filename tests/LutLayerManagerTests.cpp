@@ -301,6 +301,45 @@ LutData makeBenchmarkLut(int size) {
   return lut;
 }
 
+void testColorSpaceConversionToggle() {
+  const LutData lut = makeBenchmarkLut(33);
+  RenderParams enabledParams;
+  enabledParams.colorSpaceConversionEnabled = true;
+  enabledParams.nodeColorSpace = static_cast<int>(ColorSpaceId::DaVinciIntermediate);
+  enabledParams.lutInputColorSpace = static_cast<int>(ColorSpaceId::DjiDLog);
+  enabledParams.lutOutputColorSpace = static_cast<int>(ColorSpaceId::Rec709Gamma24);
+  enabledParams.returnToNodeColorSpace = false;
+
+  RenderParams disabledParams = enabledParams;
+  disabledParams.colorSpaceConversionEnabled = false;
+  const PreparedProcessor disabledProcessor = prepareProcessor(lut, disabledParams);
+
+  require(disabledProcessor.nodeToLutInput.identity &&
+            disabledProcessor.layer.inputToOutput.identity &&
+            disabledProcessor.lutOutputToNode.identity,
+          "Disabling color-space conversion should make every color transform an identity");
+  require(disabledProcessor.returnToNodeColorSpace,
+          "The disabled mode should remain in the current node space");
+  require(disabledProcessor.directLutOnly,
+          "Default layer controls with conversion disabled should use the direct LUT path");
+
+  const Vec3 source{0.32, 0.41, 0.56};
+  const Vec3 directResult = lut.apply(source);
+  const Vec3 disabledResult = disabledProcessor.apply(source);
+  requireColorNear(disabledResult, directResult, 1e-12,
+                   "Disabled color-space conversion should apply the LUT directly to node pixels");
+
+  const Vec3 enabledResult = prepareProcessor(lut, enabledParams).apply(source);
+  const double enabledDifference = std::max({std::abs(enabledResult.r - directResult.r),
+                                              std::abs(enabledResult.g - directResult.g),
+                                              std::abs(enabledResult.b - directResult.b)});
+  require(enabledDifference > 1e-4,
+          "Enabling color-space conversion should honor the selected LUT spaces");
+  require(acceleratedCacheKey("toggle-test", enabledParams, 65) !=
+            acceleratedCacheKey("toggle-test", disabledParams, 65),
+          "The accelerated cache key should include the color-space conversion toggle");
+}
+
 void testPreparedColorTransformsMatchReference() {
   const Vec3 sample{0.27, 0.43, 0.61};
   double maximumFastError = 0.0;
@@ -551,6 +590,7 @@ int main() {
     testIdentityLutPreservesColorAcrossWorkingSpaces();
     testLutWorkingSpaceChangesNonIdentityResult();
     testTechnicalLutInputAndOutputSpaces();
+    testColorSpaceConversionToggle();
     testPreparedColorTransformsMatchReference();
     testAcceleratedLutMatchesPreparedProcessor();
 #ifdef __APPLE__
